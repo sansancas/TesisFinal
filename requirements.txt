@@ -1,0 +1,12 @@
+# Core deep-learning stack
+tensorflow>=2.15.0
+keras>=3.0.0
+
+# Scientific computing & data handling
+numpy>=1.23.0
+pandas>=1.5.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# EEG signal processing
+mne>=1.5.0
