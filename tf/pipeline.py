@@ -449,6 +449,7 @@ def make_model(
             separable=False,
             se_ratio=16,
             feat_input_dim=feat_dim,
+            use_attention_pool_win=True,
             koopman_latent_dim=0,
             koopman_loss_weight=0.0,
             use_reconstruction_head=False,
