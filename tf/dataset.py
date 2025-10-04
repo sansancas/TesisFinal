@@ -2,6 +2,7 @@ import os
 import gc
 import glob
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from uuid import uuid4
 import numpy as np
 import tensorflow as tf
@@ -13,6 +14,7 @@ from collections import defaultdict
 from typing import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, fields
 import hashlib
+from numpy.lib.stride_tricks import as_strided
 from utils import TFRecordExportConfig, apply_preprocess_config, PipelineConfig, SPLIT_ATTRS, PREPROCESS, BANDPASS, NOTCH, NORMALIZE
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -173,119 +175,6 @@ def read_intervals(csv_path: Path) -> list[tuple[float, float]]:
         if "seiz" in label:
             intervals.append((float(row["start_time"]), float(row["stop_time"])))
     return intervals
-
-
-def discover_records(
-    base_dir: Path,
-    *,
-    max_records: int,
-    max_per_patient: int,
-    include_background_only: bool = False,
-) -> list[Path]:
-    if not base_dir.exists():
-        return []
-    csv_files = sorted(base_dir.rglob("*_bi.csv"))
-    ordered_candidates: list[tuple[Path, str, bool]] = []
-    seen: set[str] = set()
-    positive_candidates = 0
-    background_candidates_total = 0
-    for csv_path in csv_files:
-        intervals = read_intervals(csv_path)
-        has_seizure = bool(intervals)
-        if not has_seizure and not include_background_only:
-            continue
-        stem = csv_path.stem
-        candidates = [csv_path.with_suffix(".edf")]
-        if stem.endswith("_bi"):
-            candidates.append(csv_path.with_name(stem[:-3] + ".edf"))
-        candidates.append(csv_path.with_suffix(".edf.gz"))
-        if stem.endswith("_bi"):
-            candidates.append(csv_path.with_name(stem[:-3] + ".edf.gz"))
-        edf_path = next((p for p in candidates if p.exists()), None)
-        if edf_path is None:
-            continue
-        key = str(edf_path.resolve())
-        if key in seen:
-            continue
-        seen.add(key)
-        patient_id = edf_path.stem.split("_")[0]
-        if has_seizure:
-            positive_candidates += 1
-        else:
-            background_candidates_total += 1
-        ordered_candidates.append((edf_path, patient_id, has_seizure))
-        if not include_background_only and positive_candidates >= max_records:
-            break
-
-    selected: list[Path] = []
-    patient_counts: dict[str, int] = defaultdict(int)
-    background_selected = 0
-
-    for path, patient_id, has_seizure in ordered_candidates:
-        if patient_counts[patient_id] >= max_per_patient:
-            continue
-        selected.append(path)
-        patient_counts[patient_id] += 1
-        if not has_seizure:
-            background_selected += 1
-        if len(selected) >= max_records:
-            break
-
-    if include_background_only and background_candidates_total:
-        if background_selected == 0:
-            print(
-                f"ℹ️  Se identificaron {background_candidates_total} registros solo fondo en '{base_dir}',"
-                f" pero no se añadieron por llegar al límite max_records={max_records}."
-            )
-        else:
-            print(
-                f"ℹ️  Registros solo fondo incluidos desde '{base_dir}': {background_selected}"
-                f" (de {background_candidates_total} candidatos)."
-            )
-
-    return selected
-
-
-def discover_records_multi(
-    base_dirs: Iterable[Path],
-    *,
-    max_records: int,
-    max_per_patient: int,
-    include_background_only: bool = False,
-) -> tuple[list[Path], dict[str, int]]:
-    collected: list[Path] = []
-    seen: set[str] = set()
-    patient_counts: dict[str, int] = defaultdict(int)
-    split_counts: dict[str, int] = defaultdict(int)
-    for base_dir in base_dirs:
-        if len(collected) >= max_records:
-            break
-        remaining = max_records - len(collected)
-        for path in discover_records(
-            base_dir,
-            max_records=remaining,
-            max_per_patient=max_per_patient,
-            include_background_only=include_background_only,
-        ):
-            key = str(path.resolve())
-            if key in seen:
-                continue
-            patient_id = path.stem.split("_")[0]
-            if patient_counts[patient_id] >= max_per_patient:
-                continue
-            split_name = "unknown"
-            parts = path.parts
-            if "edf" in parts:
-                idx = parts.index("edf")
-                if idx + 1 < len(parts):
-                    split_name = parts[idx + 1]
-            collected.append(path)
-            seen.add(key)
-            patient_counts[patient_id] += 1
-            split_counts[split_name] += 1
-            if len(collected) >= max_records:
-                break
-    return collected, dict(split_counts)
 
 
 def consolidate_records(primary: Iterable[Path], fallback: Iterable[Path], *, max_records: int, max_per_patient: int) -> list[Path]:
@@ -456,6 +345,12 @@ def compute_feature_vector(eeg_tc: np.ndarray, fs: float, *, eps: float) -> dict
         (spec["bp_theta"] + spec["bp_alpha"]) / (spec["bp_alpha"] + spec["bp_beta"] + eps)
     )
     return feats
+
+
+def _feature_row_worker(args: tuple[np.ndarray, float, float, Sequence[str]]) -> list[float]:
+    window, fs, eps, feature_names = args
+    feats = compute_feature_vector(window, fs, eps=eps)
+    return [float(feats[name]) for name in feature_names]
 
 
 @dataclass
@@ -940,6 +835,14 @@ def load_record_from_tfrecord(
     return result
 
 
+def _is_memmap_array(obj: object) -> bool:
+    if isinstance(obj, np.memmap):
+        return True
+    if isinstance(obj, np.ndarray) and getattr(obj, "base", None) is not None:
+        return isinstance(obj.base, np.memmap)
+    return False
+
+
 def build_tf_dataset_from_arrays(
     inputs: np.ndarray | tuple[np.ndarray, np.ndarray],
     labels: np.ndarray,
@@ -951,7 +854,53 @@ def build_tf_dataset_from_arrays(
     prefetch: int | None,
     cache: str | bool | None,
 ):
-    dataset = tf.data.Dataset.from_tensor_slices((inputs, labels))
+    if isinstance(inputs, tuple):
+        seq_array, feat_array = inputs
+    else:
+        seq_array = inputs
+        feat_array = None
+
+    needs_generator = _is_memmap_array(seq_array) or _is_memmap_array(labels) or (feat_array is not None and _is_memmap_array(feat_array))
+
+    if not needs_generator:
+        dataset = tf.data.Dataset.from_tensor_slices((inputs, labels))
+    else:
+        seq_dtype = tf.as_dtype(seq_array.dtype)
+        seq_shape = tuple(int(dim) for dim in seq_array.shape[1:])
+        label_dtype = tf.as_dtype(labels.dtype)
+        label_shape = tuple(int(dim) for dim in labels.shape[1:])
+
+        if feat_array is not None:
+            feat_dtype = tf.as_dtype(feat_array.dtype)
+            feat_shape = tuple(int(dim) for dim in feat_array.shape[1:])
+
+            output_signature = (
+                (
+                    tf.TensorSpec(shape=seq_shape, dtype=seq_dtype),
+                    tf.TensorSpec(shape=feat_shape, dtype=feat_dtype),
+                ),
+                tf.TensorSpec(shape=label_shape, dtype=label_dtype),
+            )
+
+            def _generator():
+                for idx in range(labels.shape[0]):
+                    yield (seq_array[idx], feat_array[idx]), labels[idx]
+
+        else:
+            output_signature = (
+                tf.TensorSpec(shape=seq_shape, dtype=seq_dtype),
+                tf.TensorSpec(shape=label_shape, dtype=label_dtype),
+            )
+
+            def _generator():
+                for idx in range(labels.shape[0]):
+                    yield seq_array[idx], labels[idx]
+
+        dataset = tf.data.Dataset.from_generator(
+            _generator,
+            output_signature=output_signature,
+        )
+
     if cache:
         if isinstance(cache, str):
             cache_path = Path(cache)
@@ -1008,6 +957,155 @@ def resolve_cache_target(
         suffix_part = f"_{'_'.join(suffix_tokens)}" if suffix_tokens else ""
         return f"{cache_option}{suffix_part}"
     return True
+
+
+CACHE_MAGIC = "TPTCACHE_V1"
+CACHE_VERSION = 1
+
+
+def _cache_file_path(base_dir: Path, kind: str, split_name: str, entity_id: str) -> Path:
+    return Path(base_dir) / f"by_{kind}" / split_name / f"{entity_id}.npz"
+
+
+def _write_np_cache(
+    path: Path,
+    *,
+    sequences: np.ndarray,
+    labels: np.ndarray,
+    patients: Sequence[str],
+    records: Sequence[str],
+    label_mode: str,
+    hop_samples: int | None,
+    target_fs: float | None,
+    features: np.ndarray | None = None,
+    feature_names: Sequence[str] | None = None,
+    compression: str | None = None,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    seq_array = np.asarray(sequences, dtype=np.float32)
+    label_array = np.asarray(labels)
+    if label_mode == "window":
+        label_array = label_array.astype(np.int32, copy=False)
+    else:
+        label_array = label_array.astype(np.float32, copy=False)
+
+    payload: dict[str, np.ndarray] = {
+        "magic": np.array([CACHE_MAGIC], dtype="<U16"),
+        "version": np.array([CACHE_VERSION], dtype=np.int32),
+        "label_mode": np.array([label_mode], dtype="<U16"),
+        "hop_samples": np.array([hop_samples if hop_samples is not None else -1], dtype=np.int64),
+        "target_fs": np.array(
+            [target_fs if target_fs is not None else np.nan],
+            dtype=np.float32,
+        ),
+        "sequences": seq_array,
+        "labels": label_array,
+        "patients": np.asarray(list(patients), dtype="<U64"),
+        "records": np.asarray(list(records), dtype="<U128"),
+    }
+    if features is not None:
+        payload["features"] = np.asarray(features, dtype=np.float32)
+    if feature_names is not None:
+        payload["feature_names"] = np.asarray(list(feature_names), dtype="<U128")
+
+    saver = np.savez_compressed if compression else np.savez
+    saver(path, **payload)
+
+
+def _load_np_cache(
+    path: Path,
+    *,
+    include_features: bool,
+    expected_length: int | None,
+    expected_hop_samples: int | None,
+    expected_target_fs: float | None,
+    label_mode_expected: str,
+    entity_name: str,
+) -> dict[str, object] | None:
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            magic = str(data.get("magic", np.array([""], dtype="<U1"))[0])
+            if magic != CACHE_MAGIC:
+                print(f"⚠️  {entity_name}: cache incompatible (formato inesperado).")
+                return None
+            label_mode_stored = str(data.get("label_mode", np.array(["window"], dtype="<U16"))[0])
+            if label_mode_stored != label_mode_expected:
+                print(
+                    f"⚠️  {entity_name}: modo de etiqueta '{label_mode_stored}' incompatible con la configuración actual."
+                )
+                return None
+
+            sequences = np.asarray(data["sequences"], dtype=np.float32)
+            labels = np.asarray(data["labels"])
+            if expected_length is not None and sequences.shape[1] != expected_length:
+                print(
+                    f"⚠️  {entity_name}: caché descartada por longitud de ventana {sequences.shape[1]} != {expected_length}."
+                )
+                return None
+
+            hop_arr = data.get("hop_samples")
+            hop_value = int(hop_arr[0]) if hop_arr is not None else -1
+            hop_samples = None if hop_value < 0 else hop_value
+            if (
+                expected_hop_samples is not None
+                and hop_samples is not None
+                and hop_samples != expected_hop_samples
+            ):
+                print(
+                    f"⚠️  {entity_name}: caché descartada por hop_samples {hop_samples} != {expected_hop_samples}."
+                )
+                return None
+
+            target_arr = data.get("target_fs")
+            target_value = float(target_arr[0]) if target_arr is not None else float("nan")
+            target_fs = None if math.isnan(target_value) else target_value
+            if (
+                expected_target_fs is not None
+                and target_fs is not None
+                and not math.isclose(expected_target_fs, target_fs, rel_tol=1e-6, abs_tol=1e-3)
+            ):
+                print(
+                    f"⚠️  {entity_name}: caché descartada por frecuencia objetivo {target_fs:.6g} != {expected_target_fs:.6g}."
+                )
+                return None
+
+            patients = data.get("patients")
+            records = data.get("records")
+            if patients is None or records is None:
+                print(f"⚠️  {entity_name}: caché inválida (faltan IDs de paciente/registro).")
+                return None
+            patient_ids = np.asarray(patients, dtype=str)
+            record_ids = np.asarray(records, dtype=str)
+
+            features = None
+            feature_names = None
+            if include_features:
+                if "features" not in data:
+                    print(f"⚠️  {entity_name}: caché sin features requeridas; se regenerará.")
+                    return None
+                features = np.asarray(data["features"], dtype=np.float32)
+                if "feature_names" in data:
+                    feature_names = np.asarray(data["feature_names"], dtype=str).tolist()
+
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"⚠️  {entity_name}: error al leer la caché ({exc}).")
+        return None
+
+    return {
+        "sequences": sequences,
+        "labels": labels,
+        "patients": patient_ids,
+        "records": record_ids,
+        "features": features,
+        "feature_names": feature_names,
+        "hop_samples": hop_samples,
+        "target_fs": target_fs,
+    }
 
 
 def prepare_model_inputs(
@@ -1080,6 +1178,129 @@ def write_tfrecord_file(
             )
             writer.write(example)
 
+def _normalize_montage_name(name: str | None) -> str | None:
+    if name is None:
+        return None
+    normalized = name.strip().lower().replace("-", "_")
+    return normalized or None
+
+
+def _matches_montage_filter(path: Path, montage_name: str | None) -> bool:
+    if montage_name is None:
+        return True
+    montage_key = _normalize_montage_name(montage_name)
+    if montage_key is None:
+        return True
+    path_str = str(path).lower()
+    if montage_key == "ar":
+        return "_tcp_ar" in path_str and "_tcp_ar_a" not in path_str
+    if montage_key in {"ar_a", "ara"}:
+        return "_tcp_ar_a" in path_str
+    if montage_key == "le":
+        return "_tcp_le" in path_str
+    return True
+
+
+def discover_records(
+    base_dir: Path,
+    *,
+    max_records: int,
+    max_per_patient: int,
+    include_background_only: bool = False,
+    montage: str | None = None,
+) -> list[Path]:
+    if not base_dir.exists():
+        return []
+    csv_files = [path for path in sorted(base_dir.rglob("*_bi.csv")) if _matches_montage_filter(path, montage)]
+    if max_records <= 0:
+        return []
+
+    selected: list[Path] = []
+    seen: set[str] = set()
+    patient_counts: defaultdict[str, int] = defaultdict(int)
+
+    for csv_path in csv_files:
+        intervals = read_intervals(csv_path)
+        has_seizure = bool(intervals)
+        if not has_seizure and not include_background_only:
+            continue
+
+        stem = csv_path.stem
+        candidates = [csv_path.with_suffix(".edf")]
+        if stem.endswith("_bi"):
+            candidates.append(csv_path.with_name(stem[:-3] + ".edf"))
+        candidates.append(csv_path.with_suffix(".edf.gz"))
+        if stem.endswith("_bi"):
+            candidates.append(csv_path.with_name(stem[:-3] + ".edf.gz"))
+
+        valid_candidates = [p for p in candidates if p.exists() and _matches_montage_filter(p, montage)]
+        edf_path = next(iter(valid_candidates), None)
+        if edf_path is None:
+            continue
+
+        key = str(edf_path.resolve())
+        if key in seen:
+            continue
+
+        patient_id = edf_path.stem.split("_")[0]
+        if max_per_patient > 0 and patient_counts[patient_id] >= max_per_patient:
+            continue
+
+        selected.append(edf_path)
+        seen.add(key)
+        patient_counts[patient_id] += 1
+
+        if len(selected) >= max_records:
+            break
+
+    return selected
+
+
+def discover_records_multi(
+    base_dirs: Iterable[Path],
+    *,
+    max_records: int,
+    max_per_patient: int,
+    include_background_only: bool = False,
+    montage: str | None = None,
+) -> tuple[list[Path], dict[str, int]]:
+    collected: list[Path] = []
+    seen: set[str] = set()
+    patient_counts: dict[str, int] = {}
+    split_counts: dict[str, int] = {}
+    for base_dir in base_dirs:
+        if len(collected) >= max_records:
+            break
+        remaining = max_records - len(collected)
+        for path in discover_records(
+            base_dir,
+            max_records=remaining,
+            max_per_patient=max_per_patient,
+            include_background_only=include_background_only,
+            montage=montage,
+        ):
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            patient_id = path.stem.split("_")[0]
+            patient_counts.setdefault(patient_id, 0)
+            if patient_counts[patient_id] >= max_per_patient:
+                continue
+            split_name = "unknown"
+            parts = path.parts
+            if "edf" in parts:
+                idx = parts.index("edf")
+                if idx + 1 < len(parts):
+                    split_name = parts[idx + 1]
+            collected.append(path)
+            seen.add(key)
+            patient_counts[patient_id] += 1
+            split_counts[split_name] = split_counts.get(split_name, 0) + 1
+            if len(collected) >= max_records:
+                break
+    return collected, split_counts
+
+
 def build_windows_dataset(
     records: Iterable[Path],
     *,
@@ -1101,6 +1322,11 @@ def build_windows_dataset(
     storage_mode: str = "ram",
     memmap_dir: Path | str | None = None,
     memmap_prefix: str | None = None,
+    auto_memmap_threshold_bytes: int | None = None,
+    feature_worker_processes: int | None = None,
+    feature_worker_chunk_size: int | None = None,
+    feature_parallel_min_windows: int | None = None,
+    force_memmap_after_build: bool = False,
 ) -> DatasetBundle:
     config = dict(preprocess_settings)
     expected_length = int(round(window_sec * target_fs)) if target_fs > 0 and window_sec > 0 else None
@@ -1115,9 +1341,10 @@ def build_windows_dataset(
         unique_records.append(Path(candidate))
 
     storage_mode_normalized = (storage_mode or "ram").strip().lower()
+    auto_mode = storage_mode_normalized == "auto"
     use_memmap = storage_mode_normalized == "memmap"
-    if storage_mode_normalized not in {"ram", "memmap"}:
-        raise ValueError("'storage_mode' debe ser 'ram' o 'memmap'.")
+    if storage_mode_normalized not in {"ram", "memmap", "auto"}:
+        raise ValueError("'storage_mode' debe ser 'ram', 'memmap' o 'auto'.")
 
     sampling_strategy_lower = (sampling_strategy or "none").lower()
     if use_memmap and sampling_strategy_lower != "none":
@@ -1125,7 +1352,7 @@ def build_windows_dataset(
             "Las estrategias de muestreo distintas de 'none' no están disponibles con storage_mode='memmap'."
         )
 
-    if use_memmap:
+    if use_memmap or auto_mode:
         if memmap_dir is None:
             memmap_root = Path(tempfile.gettempdir()) / "tfdev_memmap"
         else:
@@ -1145,13 +1372,35 @@ def build_windows_dataset(
     requested_features = [str(name) for name in feature_subset] if feature_subset else None
     write_enabled = bool(tfrecord_export and tfrecord_export.write_enabled)
     reuse_enabled = bool(tfrecord_export and tfrecord_export.reuse_enabled)
+    cache_format = "tfrecord"
+    if tfrecord_export is not None and getattr(tfrecord_export, "format", None):
+        cache_format = str(tfrecord_export.format).lower().strip() or "tfrecord"
+    if cache_format not in {"tfrecord", "npz"}:
+        raise ValueError("'dataset_cache_format' debe ser 'tfrecord' o 'npz'.")
+    use_tfrecord_cache = cache_format == "tfrecord"
+    use_npz_cache = cache_format == "npz"
     compression = tfrecord_export.compression if tfrecord_export else None
-    base_dir = tfrecord_export.base_dir if tfrecord_export else None
+    base_dir: Path | None = None
+    if tfrecord_export and tfrecord_export.base_dir is not None:
+        base_dir = Path(tfrecord_export.base_dir).expanduser().resolve()
     split_name = tfrecord_export.split_name if tfrecord_export else ""
+    cache_enabled = write_enabled or reuse_enabled
+    if cache_enabled and base_dir is None:
+        raise ValueError("Se habilitó la caché pero no se proporcionó un directorio base.")
+    if cache_enabled and base_dir is not None:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    cache_split_name = split_name or "unspecified"
+    expected_target_for_cache = target_fs if target_fs > 0 else None
+    label_mode_expected = "time_step" if time_step_labels else "window"
+    use_npz_compression = use_npz_cache and bool(compression)
 
-    if time_step_labels and (write_enabled or reuse_enabled):
+    if time_step_labels and cache_enabled:
+        if use_tfrecord_cache:
+            raise RuntimeError(
+                "'time_step_labels' no es compatible con la exportación o reutilización de TFRecords."
+            )
         raise RuntimeError(
-            "'time_step_labels' no es compatible con la exportación o reutilización de TFRecords."
+            "La caché NPZ actual no soporta 'time_step_labels'. Desactívala o usa salidas por ventana."
         )
 
     patient_acc: defaultdict[str, dict[str, list]] | None = None
@@ -1159,6 +1408,119 @@ def build_windows_dataset(
 
     memmap_builder: _MemmapAccumulator | None = None
     memmap_artifacts: dict[str, object] | None = None
+
+    promote_threshold_bytes: int | None = None
+    if auto_mode and auto_memmap_threshold_bytes is not None:
+        if auto_memmap_threshold_bytes > 0:
+            promote_threshold_bytes = int(auto_memmap_threshold_bytes)
+    ram_usage_bytes = 0
+
+    parallel_workers = None
+    if feature_worker_processes is not None and feature_worker_processes > 0:
+        parallel_workers = int(feature_worker_processes)
+    parallel_chunk_size = None
+    if feature_worker_chunk_size is not None and feature_worker_chunk_size > 0:
+        parallel_chunk_size = int(feature_worker_chunk_size)
+    min_windows_parallel = 32
+    if feature_parallel_min_windows is not None and feature_parallel_min_windows > 0:
+        min_windows_parallel = int(feature_parallel_min_windows)
+
+    def _ensure_memmap_initialized(
+        window_shape: tuple[int, int],
+        label_shape: tuple[int, ...],
+        label_dtype: np.dtype,
+        feature_dim: int | None,
+    ) -> _MemmapAccumulator:
+        nonlocal memmap_builder, memmap_artifacts
+        if memmap_root is None or memmap_prefix_value is None:
+            raise RuntimeError("Configuración inválida de memmap (ruta o prefijo no definidos).")
+        if memmap_builder is None:
+            memmap_builder = _MemmapAccumulator(
+                base_dir=memmap_root,
+                prefix=memmap_prefix_value,
+                window_shape=window_shape,
+                label_shape=label_shape,
+                label_dtype=label_dtype,
+                include_features=include_features,
+                feature_dim=feature_dim,
+            )
+            memmap_artifacts = dict(memmap_builder.artifacts)
+        return memmap_builder
+
+    def _move_batches_to_memmap(
+        window_shape: tuple[int, int],
+        label_shape: tuple[int, ...],
+        label_dtype: np.dtype,
+        feature_dim: int | None,
+    ) -> _MemmapAccumulator:
+        nonlocal sequence_batches, label_batches, feature_batches, use_memmap, ram_usage_bytes, memmap_artifacts
+        if sampling_strategy_lower != "none":
+            raise RuntimeError(
+                "Las estrategias de muestreo distintas de 'none' no están disponibles cuando se requiere memmap. "
+                "Ajusta 'dataset_storage', incrementa el umbral o desactiva el muestreo."
+            )
+        builder = _ensure_memmap_initialized(window_shape, label_shape, label_dtype, feature_dim)
+        for idx, seq_batch in enumerate(sequence_batches):
+            label_batch = label_batches[idx]
+            feat_batch = feature_batches[idx] if include_features else None
+            builder.append(seq_batch, label_batch, feat_batch)
+        sequence_batches.clear()
+        label_batches.clear()
+        if include_features:
+            feature_batches.clear()
+        use_memmap = True
+        ram_usage_bytes = 0
+        memmap_artifacts = dict(builder.artifacts)
+        gc.collect()
+        return builder
+
+    def _append_batch(
+        seq_array: np.ndarray,
+        label_array: np.ndarray,
+        feature_array_local: np.ndarray | None,
+    ) -> None:
+        nonlocal ram_usage_bytes, use_memmap, memmap_artifacts
+        if include_features and feature_array_local is None:
+            raise RuntimeError("Se solicitaron features pero no se proporcionaron datos.")
+        batch_bytes = seq_array.nbytes + label_array.nbytes
+        if include_features and feature_array_local is not None:
+            batch_bytes += feature_array_local.nbytes
+        window_shape_local = tuple(int(x) for x in seq_array.shape[1:])
+        if label_array.ndim > 1:
+            label_shape_local = tuple(int(x) for x in label_array.shape[1:])
+        else:
+            label_shape_local = ()
+        label_dtype_local = np.dtype(label_array.dtype)
+        feature_dim_local = int(feature_array_local.shape[1]) if (include_features and feature_array_local is not None) else None
+
+        if auto_mode and not use_memmap and promote_threshold_bytes is not None:
+            projected = ram_usage_bytes + batch_bytes
+            if projected > promote_threshold_bytes:
+                builder = _move_batches_to_memmap(
+                    window_shape_local,
+                    label_shape_local,
+                    label_dtype_local,
+                    feature_dim_local,
+                )
+                builder.append(seq_array, label_array, feature_array_local)
+                memmap_artifacts = dict(builder.artifacts)
+                return
+
+        if use_memmap:
+            builder = _ensure_memmap_initialized(
+                window_shape_local,
+                label_shape_local,
+                label_dtype_local,
+                feature_dim_local,
+            )
+            builder.append(seq_array, label_array, feature_array_local)
+            memmap_artifacts = dict(builder.artifacts)
+        else:
+            sequence_batches.append(seq_array)
+            label_batches.append(label_array)
+            if include_features and feature_array_local is not None:
+                feature_batches.append(feature_array_local)
+            ram_usage_bytes += batch_bytes
 
     if write_enabled:
         patient_acc = defaultdict(
@@ -1182,9 +1544,13 @@ def build_windows_dataset(
         patient_path: Path | None = None
         record_exists = False
         patient_exists = False
-        if base_dir is not None:
-            record_path = base_dir / "by_record" / split_name / f"{record_id}.tfrecord"
-            patient_path = base_dir / "by_patient" / split_name / f"{patient_id}.tfrecord"
+        if cache_enabled and base_dir is not None:
+            if use_tfrecord_cache:
+                record_path = base_dir / "by_record" / split_name / f"{record_id}.tfrecord"
+                patient_path = base_dir / "by_patient" / split_name / f"{patient_id}.tfrecord"
+            else:
+                record_path = _cache_file_path(base_dir, "record", cache_split_name, record_id)
+                patient_path = _cache_file_path(base_dir, "patient", cache_split_name, patient_id)
             record_exists = record_path.exists()
             patient_exists = patient_path.exists()
             if write_enabled and not patient_exists:
@@ -1197,117 +1563,197 @@ def build_windows_dataset(
             print(f"ℹ️  {record_id}: solo etiquetas de fondo; se incluirá con ventanas negativas.")
 
         if reuse_enabled and record_exists and record_path is not None:
-            loaded = load_record_from_tfrecord(
-                record_path,
-                compression=compression,
-                include_features=include_features,
-                expected_length=expected_length,
-                expected_hop_samples=expected_hop_samples,
-                expected_target_fs=target_fs,
-            )
-            if loaded is not None:
-                loaded_sequences = loaded["sequences"]
-                loaded_labels = loaded["labels"]
-                loaded_patients = loaded["patients"]
-                loaded_records = loaded["records"]
-                loaded_features = loaded.get("features") if include_features else None
-                loaded_hop_samples = loaded.get("hop_samples")
-                loaded_target_fs = loaded.get("target_fs")
+            reused_from_cache = False
+            if use_tfrecord_cache:
+                loaded = load_record_from_tfrecord(
+                    record_path,
+                    compression=compression,
+                    include_features=include_features,
+                    expected_length=expected_length,
+                    expected_hop_samples=expected_hop_samples,
+                    expected_target_fs=expected_target_for_cache,
+                )
+                if loaded is not None:
+                    loaded_sequences = loaded["sequences"]
+                    loaded_labels = loaded["labels"]
+                    loaded_patients = loaded["patients"]
+                    loaded_records = loaded["records"]
+                    loaded_features = loaded.get("features") if include_features else None
+                    loaded_hop_samples = loaded.get("hop_samples")
+                    loaded_target_fs = loaded.get("target_fs")
 
-                can_reuse = True
-                if include_features:
-                    if loaded_features is None:
-                        can_reuse = False
-                    else:
-                        loaded_features = np.asarray(loaded_features, dtype=np.float32)
-                        if requested_features is not None:
-                            if feature_keys is None:
-                                feature_keys = list(requested_features)
-                            expected_dim = len(feature_keys)
-                            if loaded_features.shape[1] != expected_dim:
+                    can_reuse = True
+                    if include_features:
+                        if loaded_features is None:
+                            can_reuse = False
+                        else:
+                            loaded_features = np.asarray(loaded_features, dtype=np.float32)
+                            if requested_features is not None:
+                                if feature_keys is None:
+                                    feature_keys = list(requested_features)
+                                expected_dim = len(feature_keys)
+                                if loaded_features.shape[1] != expected_dim:
+                                    print(
+                                        f"⚠️  {record_id}: TFRecord contiene {loaded_features.shape[1]} features "
+                                        f"pero se solicitaron {expected_dim}; se regenerará desde EDF."
+                                    )
+                                    can_reuse = False
+                            elif feature_keys is None:
+                                feature_keys = [f"feature_{idx}" for idx in range(loaded_features.shape[1])]
+
+                    if can_reuse:
+                        reused_sequences = np.asarray(loaded_sequences, dtype=np.float32)
+                        if time_step_labels:
+                            reused_labels = np.asarray(loaded_labels, dtype=np.float32)
+                        else:
+                            reused_labels = np.asarray(loaded_labels, dtype=np.int32)
+
+                        if include_features and loaded_features is not None:
+                            reused_features = np.asarray(loaded_features, dtype=np.float32)
+                        else:
+                            reused_features = None
+
+                        _append_batch(reused_sequences, reused_labels, reused_features)
+
+                        patient_list.extend(list(loaded_patients))
+                        record_list.extend(list(loaded_records))
+
+                        if (
+                            write_enabled
+                            and patient_path is not None
+                            and not patient_exists
+                            and patient_acc is not None
+                        ):
+                            bundle = patient_acc[patient_id]
+                            bundle["sequences"].append(reused_sequences)
+                            bundle["labels"].append(reused_labels)
+                            bundle["records"].extend(list(loaded_records))
+                            if include_features and reused_features is not None:
+                                bundle["features"].append(reused_features)
+                            if bundle["hop_samples"] is None:
+                                bundle["hop_samples"] = int(loaded_hop_samples) if loaded_hop_samples is not None else expected_hop_samples
+                            elif loaded_hop_samples is not None and bundle["hop_samples"] != int(loaded_hop_samples):
                                 print(
-                                    f"⚠️  {record_id}: TFRecord contiene {loaded_features.shape[1]} features "
-                                    f"pero se solicitaron {expected_dim}; se regenerará desde EDF."
+                                    f"⚠️  {record_id}: hop_samples inconsistente entre registros del mismo paciente; "
+                                    "se usará el valor inicial."
                                 )
-                                can_reuse = False
-                        elif feature_keys is None:
-                            feature_keys = [f"feature_{idx}" for idx in range(loaded_features.shape[1])]
+                            if bundle["target_fs"] is None:
+                                bundle["target_fs"] = float(loaded_target_fs) if loaded_target_fs is not None else float(target_fs)
+                            elif loaded_target_fs is not None and not math.isclose(bundle["target_fs"], float(loaded_target_fs), rel_tol=1e-6, abs_tol=1e-6):
+                                print(
+                                    f"⚠️  {record_id}: frecuencia objetivo inconsistente entre registros del mismo paciente; "
+                                    f"se usará el valor inicial ({bundle['target_fs']:.6g})."
+                                )
 
-                if can_reuse:
-                    reused_sequences = np.asarray(loaded_sequences, dtype=np.float32)
-                    if time_step_labels:
-                        reused_labels = np.asarray(loaded_labels, dtype=np.float32)
-                        label_shape = reused_labels.shape[1:]
-                        label_dtype = np.float32
-                    else:
-                        reused_labels = np.asarray(loaded_labels, dtype=np.int32)
-                        label_shape = ()
-                        label_dtype = np.int32
-
-                    if include_features and loaded_features is not None:
-                        reused_features = np.asarray(loaded_features, dtype=np.float32)
-                        feature_dim = int(reused_features.shape[1])
-                    else:
-                        reused_features = None
-                        feature_dim = None
-
-                    if use_memmap:
-                        if memmap_builder is None:
-                            if memmap_root is None or memmap_prefix_value is None:
-                                raise RuntimeError("Configuración inválida de memmap (ruta o prefijo no definidos).")
-
-                            memmap_builder = _MemmapAccumulator(
-                                base_dir=memmap_root,
-                                prefix=memmap_prefix_value,
-                                window_shape=reused_sequences.shape[1:],
-                                label_shape=label_shape,
-                                label_dtype=label_dtype,
-                                include_features=include_features,
-                                feature_dim=feature_dim,
-                            )
-                            memmap_artifacts = dict(memmap_builder.artifacts)
-                        memmap_builder.append(reused_sequences, reused_labels, reused_features)
-                    else:
-                        sequence_batches.append(reused_sequences)
-                        label_batches.append(reused_labels)
-                        if include_features and reused_features is not None:
-                            feature_batches.append(reused_features)
-
-                    patient_list.extend(list(loaded_patients))
-                    record_list.extend(list(loaded_records))
-
-                    if write_enabled and patient_path is not None and not patient_exists and patient_acc is not None:
-                        bundle = patient_acc[patient_id]
-                        bundle["sequences"].append(reused_sequences)
-                        bundle["labels"].append(reused_labels)
-                        bundle["records"].extend(list(loaded_records))
-                        if include_features and reused_features is not None:
-                            bundle["features"].append(reused_features)
-                        if bundle["hop_samples"] is None:
-                            bundle["hop_samples"] = int(loaded_hop_samples) if loaded_hop_samples is not None else expected_hop_samples
-                        elif loaded_hop_samples is not None and bundle["hop_samples"] != int(loaded_hop_samples):
-                            print(
-                                f"⚠️  {record_id}: hop_samples inconsistente entre registros del mismo paciente; "
-                                "se usará el valor inicial."
-                            )
-                        if bundle["target_fs"] is None:
-                            bundle["target_fs"] = float(loaded_target_fs) if loaded_target_fs is not None else float(target_fs)
-                        elif loaded_target_fs is not None and not math.isclose(bundle["target_fs"], float(loaded_target_fs), rel_tol=1e-6, abs_tol=1e-6):
-                            print(
-                                f"⚠️  {record_id}: frecuencia objetivo inconsistente entre registros del mismo paciente; "
-                                "se usará el valor inicial ({bundle['target_fs']:.6g})."
-                            )
-
-                    print(
-                        f"✓ {record_id}: {loaded_labels.shape[0]} ventanas cargadas desde TFRecord "
-                        f"(positividad {float(np.mean(loaded_labels)) if loaded_labels.size else 0.0:.3f})"
-                    )
-                    continue
+                        print(
+                            f"✓ {record_id}: {reused_labels.shape[0]} ventanas cargadas desde TFRecord "
+                            f"(positividad {float(np.mean(reused_labels)) if reused_labels.size else 0.0:.3f})"
+                        )
+                        reused_from_cache = True
+                        continue
             else:
+                loaded = _load_np_cache(
+                    record_path,
+                    include_features=include_features,
+                    expected_length=expected_length,
+                    expected_hop_samples=expected_hop_samples,
+                    expected_target_fs=expected_target_for_cache,
+                    label_mode_expected=label_mode_expected,
+                    entity_name=record_id,
+                )
+                if loaded is not None:
+                    reused_sequences = np.asarray(loaded["sequences"], dtype=np.float32)
+                    loaded_labels = np.asarray(loaded["labels"])
+                    if label_mode_expected == "time_step":
+                        reused_labels = loaded_labels.astype(np.float32, copy=False)
+                    else:
+                        reused_labels = loaded_labels.astype(np.int32, copy=False)
+
+                    reused_features: np.ndarray | None = None
+                    loaded_features = loaded.get("features") if include_features else None
+                    loaded_feature_names = loaded.get("feature_names") if include_features else None
+                    can_reuse = True
+                    if include_features:
+                        if loaded_features is None:
+                            can_reuse = False
+                        else:
+                            reused_features = np.asarray(loaded_features, dtype=np.float32)
+                            if requested_features is not None:
+                                expected_names = list(requested_features)
+                                if feature_keys is None:
+                                    feature_keys = list(expected_names)
+                                if reused_features.shape[1] != len(expected_names):
+                                    print(
+                                        f"⚠️  {record_id}: la caché contiene {reused_features.shape[1]} features y"
+                                        f" se solicitaron {len(expected_names)}; se regenerará desde EDF."
+                                    )
+                                    can_reuse = False
+                            else:
+                                loaded_names_list = (
+                                    list(loaded_feature_names)
+                                    if loaded_feature_names is not None
+                                    else None
+                                )
+                                if feature_keys is None:
+                                    if loaded_names_list is not None and len(loaded_names_list) == reused_features.shape[1]:
+                                        feature_keys = list(loaded_names_list)
+                                    else:
+                                        feature_keys = [
+                                            f"feature_{idx}"
+                                            for idx in range(reused_features.shape[1])
+                                        ]
+                                elif len(feature_keys) != reused_features.shape[1]:
+                                    print(
+                                        f"⚠️  {record_id}: dimensión de features en caché {reused_features.shape[1]}"
+                                        f" ≠ {len(feature_keys)}; se regenerará desde EDF."
+                                    )
+                                    can_reuse = False
+                                elif (
+                                    loaded_names_list is not None
+                                    and feature_keys != loaded_names_list
+                                    and all(name.startswith("feature_") for name in feature_keys)
+                                    and len(feature_keys) == len(loaded_names_list)
+                                ):
+                                    feature_keys = list(loaded_names_list)
+
+                    if can_reuse:
+                        _append_batch(reused_sequences, reused_labels, reused_features)
+
+                        loaded_patients = np.asarray(loaded["patients"], dtype=str)
+                        loaded_records = np.asarray(loaded["records"], dtype=str)
+                        patient_list.extend(loaded_patients.tolist())
+                        record_list.extend(loaded_records.tolist())
+
+                        if (
+                            write_enabled
+                            and patient_path is not None
+                            and not patient_exists
+                            and patient_acc is not None
+                        ):
+                            bundle = patient_acc[patient_id]
+                            bundle["sequences"].append(reused_sequences)
+                            bundle["labels"].append(reused_labels)
+                            bundle["records"].extend(loaded_records.tolist())
+                            if include_features and reused_features is not None:
+                                bundle["features"].append(reused_features)
+                            cached_hop = loaded.get("hop_samples")
+                            cached_fs = loaded.get("target_fs")
+                            if bundle["hop_samples"] is None and cached_hop is not None:
+                                bundle["hop_samples"] = int(cached_hop)
+                            if bundle["target_fs"] is None and cached_fs is not None:
+                                bundle["target_fs"] = float(cached_fs)
+
+                        print(
+                            f"✓ {record_id}: {reused_labels.shape[0]} ventanas cargadas desde caché NPZ"
+                        )
+                        reused_from_cache = True
+                        continue
+
+            if not reused_from_cache:
                 record_exists = False
+                patient_exists = False
                 if write_enabled and patient_acc is not None:
                     patients_needing_export.add(patient_id)
-                patient_exists = False
 
         raw = None
         try:
@@ -1331,85 +1777,104 @@ def build_windows_dataset(
             continue
 
         mask = build_mask(data.shape[1], intervals, fs)
-        record_windows: list[np.ndarray] = []
-        record_labels: list[int] = []
-        feature_rows: list[np.ndarray] = []
 
-        for start in range(0, data.shape[1] - window_samples + 1, hop_samples):
-            end = start + window_samples
-            window = data[:, start:end].T.astype(np.float32)  # (time, channels)
-            segment_mask = mask[start:end]
-            record_windows.append(window)
-            if time_step_labels:
-                record_labels.append(segment_mask.astype(np.float32))
-            else:
-                label = 1 if segment_mask.mean() >= 0.5 else 0
-                record_labels.append(label)
-
-            if include_features:
-                feats = compute_feature_vector(window, fs, eps=eps)
-                if requested_features is not None:
-                    if feature_keys is None:
-                        missing = [name for name in requested_features if name not in feats]
-                        if missing:
-                            raise ValueError(
-                                "Las siguientes features solicitadas no están disponibles: "
-                                + ", ".join(sorted(missing))
-                            )
-                        feature_keys = list(requested_features)
-                    feature_rows.append(np.array([feats[k] for k in feature_keys], dtype=np.float32))
-                else:
-                    if feature_keys is None:
-                        feature_keys = sorted(feats.keys())
-                    feature_rows.append(np.array([feats[k] for k in feature_keys], dtype=np.float32))
-
-        if not record_windows:
+        available = data.shape[1] - window_samples
+        n_windows = 1 + available // hop_samples
+        if n_windows <= 0:
             print(f"⚠️  {record_id}: sin ventanas válidas después del preprocesamiento.")
             continue
 
-        record_sequences = np.stack(record_windows, axis=0)
+        data_contig = np.ascontiguousarray(data, dtype=np.float32)
+        window_view = as_strided(
+            data_contig,
+            shape=(data_contig.shape[0], n_windows, window_samples),
+            strides=(data_contig.strides[0], data_contig.strides[1] * hop_samples, data_contig.strides[1]),
+            writeable=False,
+        )
+        record_sequences = np.transpose(window_view, (1, 2, 0))
+        if not record_sequences.flags.c_contiguous:
+            record_sequences = np.ascontiguousarray(record_sequences)
+
+        mask_contig = np.ascontiguousarray(mask, dtype=np.float32)
+        mask_view = as_strided(
+            mask_contig,
+            shape=(n_windows, window_samples),
+            strides=(mask_contig.strides[0] * hop_samples, mask_contig.strides[0]),
+            writeable=False,
+        )
+
         if time_step_labels:
-            record_labels_arr = np.stack(
-                [np.asarray(vec, dtype=np.float32) for vec in record_labels], axis=0
-            )
-            label_dtype = np.float32
-            label_shape = record_labels_arr.shape[1:]
+            record_labels_arr = np.ascontiguousarray(mask_view, dtype=np.float32)
+            label_mode_local = "time_step"
         else:
-            record_labels_arr = np.asarray(record_labels, dtype=np.int32)
-            label_dtype = np.int32
-            label_shape = ()
+            record_labels_arr = (mask_view.mean(axis=1) >= 0.5).astype(np.int32)
+            label_mode_local = "window"
 
+        record_features_arr: np.ndarray | None = None
+        feature_names_local: list[str] | None = None
         if include_features:
-            if not feature_rows:
-                raise RuntimeError(
-                    "Se solicitó include_features pero no se pudieron calcular features para al menos un registro."
-                )
-            record_features_arr = np.stack(feature_rows, axis=0)
-            feature_dim = int(record_features_arr.shape[1])
-        else:
-            record_features_arr = None
-            feature_dim = None
+            feature_rows_list: list[list[float]] = []
+            feat_names_candidate = list(requested_features) if requested_features is not None else None
 
-        if use_memmap:
-            if memmap_builder is None:
-                if memmap_root is None or memmap_prefix_value is None:
-                    raise RuntimeError("Configuración inválida de memmap (ruta o prefijo no definidos).")
-                memmap_builder = _MemmapAccumulator(
-                    base_dir=memmap_root,
-                    prefix=memmap_prefix_value,
-                    window_shape=record_sequences.shape[1:],
-                    label_shape=label_shape,
-                    label_dtype=label_dtype,
-                    include_features=include_features,
-                    feature_dim=feature_dim,
-                )
-                memmap_artifacts = dict(memmap_builder.artifacts)
-            memmap_builder.append(record_sequences, record_labels_arr, record_features_arr)
+            first_feats = compute_feature_vector(record_sequences[0], fs, eps=eps)
+            if feat_names_candidate is None:
+                feature_names_local = sorted(first_feats.keys())
+            else:
+                missing = [name for name in feat_names_candidate if name not in first_feats]
+                if missing:
+                    raise ValueError(
+                        "Las siguientes features solicitadas no están disponibles: "
+                        + ", ".join(sorted(missing))
+                    )
+                feature_names_local = feat_names_candidate
+
+            feature_rows_list.append([float(first_feats[name]) for name in feature_names_local])
+
+            remaining_indices = range(1, n_windows)
+            if parallel_workers and n_windows >= max(2, min_windows_parallel):
+                windows_iter = (record_sequences[idx] for idx in remaining_indices)
+                with ProcessPoolExecutor(max_workers=parallel_workers) as executor:
+                    mapped_rows = list(
+                        executor.map(
+                            _feature_row_worker,
+                            ((window, fs, eps, feature_names_local) for window in windows_iter),
+                            chunksize=parallel_chunk_size if parallel_chunk_size else 1,
+                        )
+                    )
+                feature_rows_list.extend(mapped_rows)
+            else:
+                for idx in remaining_indices:
+                    feats = compute_feature_vector(record_sequences[idx], fs, eps=eps)
+                    missing = [name for name in feature_names_local if name not in feats]
+                    if missing:
+                        raise ValueError(
+                            "Las siguientes features solicitadas no están disponibles: "
+                            + ", ".join(sorted(missing))
+                        )
+                    feature_rows_list.append([float(feats[name]) for name in feature_names_local])
+
+            record_features_arr = np.asarray(feature_rows_list, dtype=np.float32)
+            if feature_keys is None:
+                feature_keys = list(feature_names_local)
+            else:
+                if feature_keys != feature_names_local:
+                    placeholder = all(name.startswith("feature_") for name in feature_keys)
+                    if placeholder and len(feature_keys) == len(feature_names_local):
+                        feature_keys = list(feature_names_local)
+                    else:
+                        raise RuntimeError(
+                            "La lista de features calculadas difiere de la previamente registrada."
+                        )
+
+        _append_batch(record_sequences, record_labels_arr, record_features_arr)
+
+        if label_mode_local == "time_step":
+            record_window_flags = _window_level_labels(record_labels_arr, label_mode="time_step")
+            frame_positive_ratio = float(record_labels_arr.mean()) if record_labels_arr.size else 0.0
         else:
-            sequence_batches.append(record_sequences)
-            label_batches.append(record_labels_arr)
-            if include_features and record_features_arr is not None:
-                feature_batches.append(record_features_arr)
+            record_window_flags = record_labels_arr
+            frame_positive_ratio = float(record_labels_arr.mean()) if record_labels_arr.size else 0.0
+        window_positive_ratio = float(record_window_flags.mean()) if record_window_flags.size else 0.0
 
         patient_list.extend([patient_id] * record_sequences.shape[0])
         record_list.extend([record_id] * record_sequences.shape[0])
@@ -1417,24 +1882,48 @@ def build_windows_dataset(
         if write_enabled and record_path is not None:
             record_patients = [patient_id] * record_sequences.shape[0]
             record_ids_per_window = [record_id] * record_sequences.shape[0]
-            record_labels_export = record_labels_arr.astype(np.int32, copy=False)
-            record_features_export = record_features_arr if include_features else None
+            if use_tfrecord_cache:
+                record_labels_export = record_labels_arr.astype(np.int32, copy=False)
+                record_features_export = record_features_arr if include_features else None
 
-            if not record_exists:
-                write_tfrecord_file(
-                    record_path,
-                    record_sequences,
-                    record_labels_export,
-                    record_patients,
-                    record_ids_per_window,
-                    features=record_features_export,
-                    compression=compression,
-                    hop_samples=hop_samples,
-                    target_fs=fs,
-                )
-                print(f"   ↳ TFRecord (registro) guardado: {record_path}")
+                if not record_exists:
+                    write_tfrecord_file(
+                        record_path,
+                        record_sequences,
+                        record_labels_export,
+                        record_patients,
+                        record_ids_per_window,
+                        features=record_features_export,
+                        compression=compression,
+                        hop_samples=hop_samples,
+                        target_fs=fs,
+                    )
+                    print(f"   ↳ TFRecord (registro) guardado: {record_path}")
+                else:
+                    print(f"   ↳ TFRecord (registro) ya existe, se reutiliza: {record_path}")
             else:
-                print(f"   ↳ TFRecord (registro) ya existe, se reutiliza: {record_path}")
+                labels_for_cache = (
+                    record_labels_arr.astype(np.int32, copy=False)
+                    if label_mode_local == "window"
+                    else record_labels_arr.astype(np.float32, copy=False)
+                )
+                _write_np_cache(
+                    record_path,
+                    sequences=record_sequences,
+                    labels=labels_for_cache,
+                    patients=record_patients,
+                    records=record_ids_per_window,
+                    label_mode=label_mode_local,
+                    hop_samples=hop_samples,
+                    target_fs=float(fs),
+                    features=record_features_arr if include_features else None,
+                    feature_names=feature_names_local if include_features else None,
+                    compression=compression if use_npz_compression else None,
+                )
+                if record_exists:
+                    print(f"   ↳ Caché de registro actualizada: {record_path}")
+                else:
+                    print(f"   ↳ Caché de registro guardada: {record_path}")
 
         if (
             write_enabled
@@ -1462,9 +1951,23 @@ def build_windows_dataset(
                     f"se usará el valor inicial ({patient_bundle['target_fs']:.6g})."
                 )
 
-        print(
-            f"✓ {record_id}: {len(record_labels)} ventanas generadas (positividad {np.mean(record_labels):.3f})"
-        )
+        if label_mode_local == "time_step":
+            print(
+                f"✓ {record_id}: {record_sequences.shape[0]} ventanas generadas "
+                f"(positividad ventanas {window_positive_ratio:.3f}, frames {frame_positive_ratio:.3f})"
+            )
+        else:
+            print(
+                f"✓ {record_id}: {record_sequences.shape[0]} ventanas generadas "
+                f"(positividad {window_positive_ratio:.3f})"
+            )
+
+        del record_sequences, mask_view, data_contig, window_view
+        del record_labels_arr
+        if include_features and record_features_arr is not None:
+            del record_features_arr
+        del mask_contig
+        gc.collect()
 
     if use_memmap:
         if memmap_builder is None or memmap_builder.count == 0:
@@ -1494,6 +1997,47 @@ def build_windows_dataset(
                 else np.concatenate(feature_batches, axis=0)
             )
         storage_mode_final = "ram"
+
+        if force_memmap_after_build:
+            target_root = memmap_root
+            if target_root is None:
+                if memmap_dir is not None:
+                    target_root = Path(memmap_dir).expanduser().resolve()
+                else:
+                    target_root = Path(tempfile.gettempdir()) / "tfdev_memmap"
+            target_root.mkdir(parents=True, exist_ok=True)
+            final_prefix = memmap_prefix_value or f"{condition}_{uuid4().hex[:8]}"
+            label_shape_final = labels.shape[1:] if labels.ndim > 1 else ()
+            label_dtype_final = np.dtype(labels.dtype)
+            feature_dim_final = int(feature_array.shape[1]) if (include_features and feature_array is not None) else None
+            spool_builder = _MemmapAccumulator(
+                base_dir=target_root,
+                prefix=f"{final_prefix}_flush",
+                window_shape=sequences.shape[1:],
+                label_shape=label_shape_final,
+                label_dtype=label_dtype_final,
+                include_features=include_features,
+                feature_dim=feature_dim_final,
+            )
+            seq_source = sequences
+            lbl_source = labels
+            feat_source = feature_array if include_features else None
+            spool_builder.append(seq_source, lbl_source, feature_array)
+            sequences_mm, labels_mm, feature_mm = spool_builder.finalize()
+            sequences = sequences_mm
+            labels = labels_mm
+            feature_array = feature_mm
+            storage_mode_final = "memmap"
+            memmap_artifacts = dict(spool_builder.artifacts)
+            memmap_artifacts["spooled_from_ram"] = True
+            sequence_batches.clear()
+            label_batches.clear()
+            if include_features:
+                feature_batches.clear()
+            del seq_source, lbl_source
+            if feat_source is not None:
+                del feat_source
+            gc.collect()
 
     patients = np.asarray(patient_list)
     records_arr = np.asarray(record_list)
@@ -1561,21 +2105,24 @@ def build_windows_dataset(
         artifacts_meta.update(memmap_artifacts or {})
         artifacts_meta.setdefault("windows", int(sequences.shape[0]))
         artifacts_meta.setdefault("label_shape", labels.shape[1:] if labels.ndim > 1 else ())
+        if promote_threshold_bytes is not None:
+            artifacts_meta.setdefault("auto_memmap_threshold_bytes", int(promote_threshold_bytes))
+        if parallel_workers:
+            artifacts_meta.setdefault("feature_parallel_workers", int(parallel_workers))
     else:
         artifacts_meta = {}
 
     if write_enabled and patient_acc is not None and base_dir is not None:
-        patient_dir = base_dir / "by_patient" / split_name
         for patient_id in patients_needing_export:
             bundle = patient_acc.get(patient_id)
             if not bundle or not bundle["sequences"]:
                 continue
-            patient_path = patient_dir / f"{patient_id}.tfrecord"
-            if patient_path.exists():
-                print(f"   ↳ TFRecord (paciente) sobrescrito: {patient_path}")
             seq_array = np.concatenate(bundle["sequences"], axis=0)
             label_cat = np.concatenate(bundle["labels"], axis=0)
-            label_array = label_cat.astype(np.int32, copy=False)
+            if label_mode == "window":
+                label_array = label_cat.astype(np.int32, copy=False)
+            else:
+                label_array = label_cat.astype(np.float32, copy=False)
             record_ids = bundle["records"]
             patient_ids = [patient_id] * label_array.shape[0]
             features_array = None
@@ -1583,30 +2130,58 @@ def build_windows_dataset(
                 features_array = np.concatenate(bundle["features"], axis=0)
             bundle_hop = bundle.get("hop_samples")
             if bundle_hop is None:
-                if expected_hop_samples is None:
-                    raise RuntimeError(
-                        "No se encontró metadata de hop_samples para exportar TFRecord por paciente."
-                    )
                 bundle_hop = expected_hop_samples
             bundle_target_fs = bundle.get("target_fs")
             if bundle_target_fs is None:
                 bundle_target_fs = target_fs
-            if bundle_target_fs is None:
-                raise RuntimeError(
-                    "No se encontró metadata de frecuencia objetivo para exportar TFRecord por paciente."
+
+            if use_tfrecord_cache:
+                if bundle_hop is None:
+                    raise RuntimeError(
+                        "No se encontró metadata de hop_samples para exportar TFRecord por paciente."
+                    )
+                if bundle_target_fs is None:
+                    raise RuntimeError(
+                        "No se encontró metadata de frecuencia objetivo para exportar TFRecord por paciente."
+                    )
+                patient_dir = base_dir / "by_patient" / split_name
+                patient_path = patient_dir / f"{patient_id}.tfrecord"
+                existing_patient_cache = patient_path.exists()
+                write_tfrecord_file(
+                    patient_path,
+                    seq_array,
+                    label_array.astype(np.int32, copy=False),
+                    patient_ids,
+                    record_ids,
+                    features=features_array,
+                    compression=compression,
+                    hop_samples=int(bundle_hop),
+                    target_fs=float(bundle_target_fs),
                 )
-            write_tfrecord_file(
-                patient_path,
-                seq_array,
-                label_array,
-                patient_ids,
-                record_ids,
-                features=features_array,
-                compression=compression,
-                hop_samples=int(bundle_hop),
-                target_fs=float(bundle_target_fs),
-            )
-            print(f"   ↳ TFRecord (paciente) guardado: {patient_path}")
+                if existing_patient_cache:
+                    print(f"   ↳ TFRecord (paciente) sobrescrito: {patient_path}")
+                else:
+                    print(f"   ↳ TFRecord (paciente) guardado: {patient_path}")
+            else:
+                patient_path = _cache_file_path(base_dir, "patient", cache_split_name, patient_id)
+                existing_patient_cache = patient_path.exists()
+                _write_np_cache(
+                    patient_path,
+                    sequences=seq_array,
+                    labels=label_array,
+                    patients=patient_ids,
+                    records=record_ids,
+                    label_mode=label_mode,
+                    hop_samples=int(bundle_hop) if bundle_hop is not None else None,
+                    target_fs=float(bundle_target_fs) if bundle_target_fs is not None else None,
+                    features=features_array,
+                    feature_names=feature_names if include_features else None,
+                    compression=compression if use_npz_compression else None,
+                )
+                if existing_patient_cache:
+                    print(f"   ↳ Caché de paciente actualizada: {patient_path}")
+                else:
+                    print(f"   ↳ Caché de paciente guardada: {patient_path}")
 
     unique_patients_count = np.unique(patients).size
     if label_mode == "time_step":
@@ -1662,6 +2237,7 @@ def collect_records_for_split(config: PipelineConfig, split: str) -> tuple[list[
         max_records=max_records,
         max_per_patient=config.max_per_patient,
         include_background_only=config.include_background_only_records,
+        montage=config.montage,
     )
     records = consolidate_records(
         discovered,

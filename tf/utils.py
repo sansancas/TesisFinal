@@ -123,8 +123,14 @@ class PipelineConfig:
     tfrecord_dir: Path | None = None
     tfrecord_compression: str | None = None
     reuse_existing_tfrecords: bool = True
-    dataset_storage: str = "ram"
+    dataset_cache_format: str = "npz"
+    dataset_storage: str = "auto"
     dataset_memmap_dir: Path | None = None
+    dataset_auto_memmap_threshold_mb: float | None = 2048.0
+    feature_worker_processes: int | None = None
+    feature_worker_chunk_size: int | None = 16
+    feature_parallel_min_windows: int = 32
+    dataset_force_memmap_after_build: bool = False
 
 
 @dataclass
@@ -134,6 +140,7 @@ class TFRecordExportConfig:
     compression: str | None = None
     write_enabled: bool = False
     reuse_enabled: bool = False
+    format: str = "tfrecord"
 
 
 def _as_path_list(values: Iterable[str] | None) -> list[Path]:
@@ -170,6 +177,18 @@ def load_config(config_path: str | Path | None) -> PipelineConfig:
             value = Path(value).expanduser().resolve()
         elif fdef.name == "dataset_memmap_dir" and value:
             value = Path(value).expanduser().resolve()
+        elif fdef.name == "dataset_cache_format" and value is not None:
+            value = str(value).lower().strip()
+        elif fdef.name == "dataset_auto_memmap_threshold_mb" and value is not None:
+            value = float(value)
+        elif fdef.name == "feature_worker_processes" and value is not None:
+            value = int(value)
+        elif fdef.name == "feature_worker_chunk_size" and value is not None:
+            value = int(value)
+        elif fdef.name == "feature_parallel_min_windows" and value is not None:
+            value = int(value)
+        elif fdef.name == "dataset_force_memmap_after_build" and value is not None:
+            value = bool(value)
         elif fdef.name == "preprocess_n_harmonics" and value is not None:
             value = int(value)
         elif fdef.name == "selected_features" and value is not None:
@@ -288,6 +307,10 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
         raise ValueError("'preprocess_n_harmonics' debe ser >= 0 cuando se especifica.")
     if not isinstance(config.use_class_weights, bool):
         raise ValueError("'use_class_weights' debe ser True o False.")
+    cache_format = str(config.dataset_cache_format).lower().strip()
+    if cache_format not in {"tfrecord", "npz"}:
+        raise ValueError("'dataset_cache_format' debe ser 'tfrecord' o 'npz'.")
+    config.dataset_cache_format = cache_format
     schedule_type = config.lr_schedule_type.lower()
     if schedule_type not in {"plateau", "cosine"}:
         raise ValueError("'lr_schedule_type' debe ser 'plateau' o 'cosine'.")
@@ -366,13 +389,35 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
     if not isinstance(config.reuse_existing_tfrecords, bool):
         raise ValueError("'reuse_existing_tfrecords' debe ser True o False.")
     storage_mode = str(config.dataset_storage).lower().strip()
-    if storage_mode not in {"ram", "memmap"}:
-        raise ValueError("'dataset_storage' debe ser 'ram' o 'memmap'.")
+    allowed_storage_modes = {"ram", "memmap", "auto"}
+    if storage_mode not in allowed_storage_modes:
+        raise ValueError("'dataset_storage' debe ser 'ram', 'memmap' o 'auto'.")
     config.dataset_storage = storage_mode
-    if storage_mode == "memmap" and config.sampling_strategy != "none":
-        raise ValueError("'dataset_storage'='memmap' requiere 'sampling_strategy': 'none'.")
     if config.dataset_memmap_dir is not None and not isinstance(config.dataset_memmap_dir, Path):
         raise ValueError("'dataset_memmap_dir' debe ser una ruta válida o None.")
+    if storage_mode == "memmap" and config.sampling_strategy != "none":
+        raise ValueError("'dataset_storage'='memmap' requiere 'sampling_strategy': 'none'.")
+    if storage_mode == "auto":
+        if config.dataset_auto_memmap_threshold_mb is not None:
+            config.dataset_auto_memmap_threshold_mb = float(config.dataset_auto_memmap_threshold_mb)
+            if math.isnan(config.dataset_auto_memmap_threshold_mb):
+                raise ValueError("'dataset_auto_memmap_threshold_mb' no puede ser NaN.")
+            if config.dataset_auto_memmap_threshold_mb < 0:
+                config.dataset_auto_memmap_threshold_mb = None
+    if config.feature_worker_processes is not None:
+        config.feature_worker_processes = int(config.feature_worker_processes)
+        if config.feature_worker_processes <= 0:
+            config.feature_worker_processes = None
+    if config.feature_worker_chunk_size is not None:
+        config.feature_worker_chunk_size = int(config.feature_worker_chunk_size)
+        if config.feature_worker_chunk_size <= 0:
+            config.feature_worker_chunk_size = None
+    if config.feature_parallel_min_windows is not None:
+        config.feature_parallel_min_windows = int(config.feature_parallel_min_windows)
+        if config.feature_parallel_min_windows <= 0:
+            config.feature_parallel_min_windows = 1
+    if config.dataset_force_memmap_after_build is not None and not isinstance(config.dataset_force_memmap_after_build, bool):
+        raise ValueError("'dataset_force_memmap_after_build' debe ser True o False.")
     if config.time_step_labels:
         if config.write_tfrecords:
             raise ValueError("'time_step_labels' no es compatible con 'write_tfrecords'.")
@@ -485,18 +530,23 @@ def resolve_checkpoint_dir(config: PipelineConfig, run_id: str) -> Path:
 
 
 def resolve_epoch_time_log_path(config: PipelineConfig, run_id: str) -> Path:
-    base_dir: Path | None = config.output_dir
+    base_dir = Path(config.output_dir) if config.output_dir is not None else None
     custom = config.epoch_time_log_path
     if custom is not None:
         custom_path = Path(custom)
-        if custom_path.is_absolute():
-            path = custom_path
+        base_str = str(custom_path)
+        if "{run_id}" in base_str:
+            candidate = Path(base_str.format(run_id=run_id))
+        elif custom_path.suffix:
+            candidate = custom_path.with_name(f"{custom_path.stem}_{run_id}{custom_path.suffix}")
         else:
+            candidate = custom_path / f"{run_id}_epoch_times.csv"
+        if not candidate.is_absolute():
             target_base = base_dir if base_dir is not None else (Path.cwd() / "runs" / run_id)
-            path = target_base / custom_path
+            candidate = (target_base / candidate).resolve()
     elif base_dir is not None:
-        path = base_dir / "epoch_times.csv"
+        candidate = base_dir / "epoch_times.csv"
     else:
-        path = Path.cwd() / "runs" / run_id / "epoch_times.csv"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+        candidate = Path.cwd() / "runs" / run_id / "epoch_times.csv"
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    return candidate

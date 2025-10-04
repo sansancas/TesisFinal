@@ -8,6 +8,7 @@ If no argumento se pasa, se utilizará ``nn_pipeline_config.json`` en el directo
 from __future__ import annotations
 
 import contextlib
+import csv
 import json
 import math
 import pickle
@@ -39,6 +40,18 @@ from sklearn.preprocessing import StandardScaler
 from dataset import DatasetBundle, prepare_model_inputs, resolve_cache_target, _flatten_labels_to_frames, _window_level_labels, _ensure_probability_matrix, build_tf_dataset_from_arrays, collect_records_for_split, build_windows_dataset, summarize_dataset_bundle
 from utils import TFRecordExportConfig, PipelineConfig, FoldResult, config_to_dict, load_config, validate_config, resolve_preprocess_settings, resolve_epoch_time_log_path, resolve_checkpoint_dir, DEFAULT_CONFIG_FILENAME, save_cv_outputs
 
+
+def _json_default(value: object) -> object:
+    if isinstance(value, (np.floating, np.float32, np.float64)):
+        return float(value)
+    if isinstance(value, (np.integer, np.int32, np.int64)):
+        return int(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
 from models.Hybrid import build_hybrid
 from models.TCN import build_tcn
 
@@ -47,32 +60,64 @@ from models.TCN import build_tcn
 # -----------------------------------------------------------------------------
 
 class EpochTimeLogger(tf.keras.callbacks.Callback):
-    def __init__(self, log_path: Path, context: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        log_path: Path,
+        context: dict[str, object] | None = None,
+        *,
+        reset: bool = True,
+    ) -> None:
         super().__init__()
         self.log_path = Path(log_path)
-        self.context = dict(context or {})
+        self._base_context = dict(context or {})
+        self.context = dict(self._base_context)
+        self._fieldnames = ["timestamp", "epoch", "duration_sec", "metrics_json", "context_json"]
         self._start_time: float | None = None
-        self._ensure_header()
+        self._prepare_file(reset)
 
-    def _ensure_header(self) -> None:
+    def _prepare_file(self, reset: bool) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        if reset and self.log_path.exists():
+            try:
+                self.log_path.unlink()
+            except OSError:
+                pass
         if not self.log_path.exists() or self.log_path.stat().st_size == 0:
-            with self.log_path.open("a", encoding="utf-8") as fp:
-                fp.write("timestamp,epoch,duration_sec,context\n")
+            with self.log_path.open("w", encoding="utf-8", newline="") as fp:
+                csv.DictWriter(fp, fieldnames=self._fieldnames).writeheader()
+
+    def update_context(self, extra: dict[str, object] | None = None) -> None:
+        self.context = dict(self._base_context)
+        if extra:
+            self.context.update(extra)
 
     def on_epoch_begin(self, epoch: int, logs: dict[str, float] | None = None) -> None:
         del logs
         self._start_time = time.perf_counter()
 
     def on_epoch_end(self, epoch: int, logs: dict[str, float] | None = None) -> None:
-        del logs
+        metrics = dict(logs or {})
         if self._start_time is None:
             return
         duration = time.perf_counter() - self._start_time
+        metrics["epoch_time_sec"] = duration
+        if logs is not None:
+            logs["epoch_time_sec"] = duration
         timestamp = datetime.now(timezone.utc).isoformat()
-        context_str = json.dumps(self.context, ensure_ascii=False, sort_keys=True)
-        with self.log_path.open("a", encoding="utf-8") as fp:
-            fp.write(f"{timestamp},{epoch + 1},{duration:.6f},{context_str}\n")
+        metrics_json = json.dumps(metrics, ensure_ascii=False, sort_keys=True, default=_json_default)
+        context_json = json.dumps(self.context, ensure_ascii=False, sort_keys=True, default=_json_default)
+        with self.log_path.open("a", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=self._fieldnames)
+            writer.writerow(
+                {
+                    "timestamp": timestamp,
+                    "epoch": epoch + 1,
+                    "duration_sec": round(duration, 6),
+                    "metrics_json": metrics_json,
+                    "context_json": context_json,
+                }
+            )
+            fp.flush()
         self._start_time = None
 
 
@@ -490,6 +535,12 @@ def run_group_cv(
     if loss_description:
         print(f"   ↳ Pérdida: {loss_description}")
 
+    epoch_timer: EpochTimeLogger | None = None
+    if epoch_time_log_path is not None:
+        base_context = dict(epoch_time_log_context or {})
+        base_context.setdefault("phase", "cv")
+        epoch_timer = EpochTimeLogger(epoch_time_log_path, base_context)
+
     for fold_idx, (train_idx, val_idx) in enumerate(
         group_kfold.split(sequences, labels_for_split, groups=patients), start=1
     ):
@@ -566,10 +617,9 @@ def run_group_cv(
                 MaxTimeStopping(max_training_minutes * 60.0, verbose=verbose_level)
             )
 
-        if epoch_time_log_path is not None:
-            context = dict(epoch_time_log_context or {})
-            context.update({"fold": fold_idx, "stage": "cv_train"})
-            callbacks.append(EpochTimeLogger(epoch_time_log_path, context))
+        if epoch_timer is not None:
+            epoch_timer.update_context({"fold": fold_idx})
+            callbacks.append(epoch_timer)
 
         if checkpoint_dir is not None and save_metric_checkpoints:
             fold_dir = checkpoint_dir / f"fold_{fold_idx:02d}"
@@ -845,17 +895,19 @@ def train_full_dataset(
             MaxTimeStopping(config.max_training_minutes * 60.0, verbose=config.verbose)
         )
 
+    epoch_timer: EpochTimeLogger | None = None
     if epoch_time_log_path is not None:
-        context = dict(epoch_time_log_context or {})
-        context.setdefault("stage", "final_train")
-        callbacks.append(EpochTimeLogger(epoch_time_log_path, context))
+        base_context = dict(epoch_time_log_context or {})
+        base_context.setdefault("phase", "final")
+        epoch_timer = EpochTimeLogger(epoch_time_log_path, base_context)
+        callbacks.append(epoch_timer)
 
     if checkpoint_dir is not None and save_metric_checkpoints:
         final_dir = checkpoint_dir / "final"
         callbacks.extend(
             create_metric_checkpoint_callbacks(
                 final_dir,
-                metrics=("pr_auc", "auc", "precision"),
+                metrics=("pr_auc", "auc", "recall"),
                 has_validation=has_validation,
                 prefix="final_",
                 verbose=config.verbose,
@@ -1016,6 +1068,8 @@ def save_final_outputs(
         "eval_samples": 0 if eval_predictions is None else int(eval_predictions.shape[0]),
         "model_path": str(model_path),
     }
+    if config.epoch_time_log_path is not None:
+        summary["epoch_time_log"] = str(config.epoch_time_log_path)
     if run_id is not None:
         summary["run_id"] = run_id
     if dataset_summaries:
@@ -1142,7 +1196,7 @@ def main(argv: list[str] | None = None) -> int:
     if config.checkpoint_dir is not None:
         config.checkpoint_dir = Path(config.checkpoint_dir) / run_id
 
-    if config.dataset_storage == "memmap":
+    if config.dataset_storage in {"memmap", "auto"}:
         if config.dataset_memmap_dir is None:
             config.dataset_memmap_dir = run_output_dir / "memmap"
         config.dataset_memmap_dir.mkdir(parents=True, exist_ok=True)
@@ -1170,7 +1224,7 @@ def main(argv: list[str] | None = None) -> int:
 
     epoch_time_log_path = resolve_epoch_time_log_path(config, run_id)
     config.epoch_time_log_path = epoch_time_log_path
-    epoch_time_context_base = {"run_id": run_id, "mode": config.mode}
+    epoch_time_context_base = {"run_id": run_id, "mode": config.mode, "model": config.model}
     print(f"🕒 Registrando tiempos de época en {epoch_time_log_path}")
     checkpoint_dir: Path | None = None
     if config.save_metric_checkpoints:
@@ -1194,6 +1248,14 @@ def main(argv: list[str] | None = None) -> int:
     eval_dataset: DatasetBundle | None = None
     dataset_summaries: dict[str, dict[str, object]] = {}
 
+    auto_memmap_threshold_bytes: int | None = None
+    if (
+        config.dataset_storage == "auto"
+        and config.dataset_auto_memmap_threshold_mb is not None
+        and config.dataset_auto_memmap_threshold_mb > 0
+    ):
+        auto_memmap_threshold_bytes = int(config.dataset_auto_memmap_threshold_mb * 1024 * 1024)
+
     def export_cfg_for(split_name: str) -> TFRecordExportConfig | None:
         if config.tfrecord_dir is None:
             return None
@@ -1207,6 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
             compression=config.tfrecord_compression,
             write_enabled=write_enabled,
             reuse_enabled=reuse_enabled,
+            format=config.dataset_cache_format,
         )
 
     try:
@@ -1230,6 +1293,11 @@ def main(argv: list[str] | None = None) -> int:
             storage_mode=config.dataset_storage,
             memmap_dir=config.dataset_memmap_dir,
             memmap_prefix=f"{run_id}_train",
+            auto_memmap_threshold_bytes=auto_memmap_threshold_bytes,
+            feature_worker_processes=config.feature_worker_processes,
+            feature_worker_chunk_size=config.feature_worker_chunk_size,
+            feature_parallel_min_windows=config.feature_parallel_min_windows,
+            force_memmap_after_build=config.dataset_force_memmap_after_build,
         )
         dataset_summaries["train"] = summarize_dataset_bundle("train", train_dataset)
 
@@ -1255,6 +1323,11 @@ def main(argv: list[str] | None = None) -> int:
                     storage_mode=config.dataset_storage,
                     memmap_dir=config.dataset_memmap_dir,
                     memmap_prefix=f"{run_id}_val",
+                    auto_memmap_threshold_bytes=auto_memmap_threshold_bytes,
+                    feature_worker_processes=config.feature_worker_processes,
+                    feature_worker_chunk_size=config.feature_worker_chunk_size,
+                    feature_parallel_min_windows=config.feature_parallel_min_windows,
+                    force_memmap_after_build=config.dataset_force_memmap_after_build,
                 )
                 dataset_summaries["val"] = summarize_dataset_bundle("val", val_dataset)
 
@@ -1279,6 +1352,11 @@ def main(argv: list[str] | None = None) -> int:
                     storage_mode=config.dataset_storage,
                     memmap_dir=config.dataset_memmap_dir,
                     memmap_prefix=f"{run_id}_eval",
+                    auto_memmap_threshold_bytes=auto_memmap_threshold_bytes,
+                    feature_worker_processes=config.feature_worker_processes,
+                    feature_worker_chunk_size=config.feature_worker_chunk_size,
+                    feature_parallel_min_windows=config.feature_parallel_min_windows,
+                    force_memmap_after_build=config.dataset_force_memmap_after_build,
                 )
                 dataset_summaries["eval"] = summarize_dataset_bundle("eval", eval_dataset)
     except Exception as err:  # pylint: disable=broad-except
