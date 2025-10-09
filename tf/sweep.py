@@ -570,6 +570,16 @@ def _prepare_trial_config(
 
     if "seed" not in params:
         config.seed = base_config.seed + trial_id
+        
+    if str(config.loss_type).lower() in {"focal", "tversky", "tversky_focal"} and config.use_class_weights:
+        config.use_class_weights = False
+        _write_log(
+            directories["logs"],
+            (
+                f"   ↳ Trial {trial_id:03d}: desactivando 'use_class_weights' porque "
+                f"loss_type={config.loss_type} requiere entrenamiento sin pesos."
+            ),
+        )
 
     runs_dir = directories["runs"]
     config.output_dir = runs_dir
