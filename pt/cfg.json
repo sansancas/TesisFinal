@@ -1,5 +1,5 @@
 {
-  "model": "tcn",
+  "model": "hybrid",
   "mode": "final",
   "train_roots": [
     "./DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3/edf/train"
