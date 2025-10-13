@@ -52,6 +52,7 @@ from dataset import (
 )
 from models.Hybrid import HybridClassifier, HybridOutputs, build_hybrid
 from models.TCN import TCNClassifier, TCNOutputs, build_tcn
+from models.Transformer import TransformerClassifier, TransformerOutputs, build_transformer
 from utils import (
     DEFAULT_CONFIG_FILENAME,
     PipelineConfig,
@@ -410,6 +411,25 @@ def safe_roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float("nan")
 
 
+def _transformer_params_from_config(config: PipelineConfig) -> dict[str, object]:
+    return {
+        "embed_dim": config.transformer_embed_dim,
+        "num_layers": config.transformer_num_layers,
+        "num_heads": config.transformer_num_heads,
+        "mlp_dim": config.transformer_mlp_dim,
+        "dropout_rate": config.transformer_dropout_rate,
+        "use_se": config.transformer_use_se,
+        "se_ratio": config.transformer_se_ratio,
+        "koopman_latent_dim": config.transformer_koopman_latent_dim,
+        "koopman_loss_weight": config.transformer_koopman_loss_weight,
+        "use_reconstruction_head": config.transformer_use_reconstruction_head,
+        "recon_weight": config.transformer_recon_weight,
+        "recon_target": config.transformer_recon_target,
+        "bottleneck_dim": config.transformer_bottleneck_dim,
+        "expand_dim": config.transformer_expand_dim,
+    }
+
+
 def make_model(
     *,
     model_type: str,
@@ -420,6 +440,7 @@ def make_model(
     dropout_rate: float,
     rnn_units: int,
     time_step: bool,
+    transformer_params: dict[str, object] | None = None,
 ) -> nn.Module:
     common_kwargs = dict(
         input_shape=input_shape,
@@ -444,6 +465,29 @@ def make_model(
             time_step=time_step,
             rnn_units=rnn_units,
             feat_input_dim=feat_dim,
+        )
+    if model_type == "transformer":
+        params = {
+            "time_step_classification": time_step,
+            "feat_input_dim": feat_dim,
+        }
+        if transformer_params:
+            params.update(transformer_params)
+        params.setdefault("embed_dim", 128)
+        params.setdefault("num_layers", 4)
+        params.setdefault("num_heads", 4)
+        params.setdefault("mlp_dim", 256)
+        params.setdefault("dropout_rate", dropout_rate)
+        params.setdefault("use_se", False)
+        params.setdefault("se_ratio", 16)
+        params.setdefault("koopman_latent_dim", 0)
+        params.setdefault("koopman_loss_weight", 0.0)
+        params.setdefault("use_reconstruction_head", False)
+        params.setdefault("recon_weight", 0.0)
+        params.setdefault("recon_target", "signal")
+        return build_transformer(
+            **common_kwargs,
+            **params,
         )
     raise ValueError(f"Modelo no soportado: {model_type}")
 
@@ -526,8 +570,11 @@ def _forward_model(
     inputs: torch.Tensor,
     feat: torch.Tensor | None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    outputs = model(inputs, feat) if isinstance(model, (TCNClassifier, HybridClassifier)) else model(inputs)
-    if isinstance(outputs, (TCNOutputs, HybridOutputs)):
+    if isinstance(model, (TCNClassifier, HybridClassifier, TransformerClassifier)):
+        outputs = model(inputs, feat)
+    else:
+        outputs = model(inputs)
+    if isinstance(outputs, (TCNOutputs, HybridOutputs, TransformerOutputs)):
         logits = outputs.logits
         aux_losses = outputs.aux_losses
     else:
@@ -733,6 +780,7 @@ def run_group_cv(
     checkpoint_dir: Path | None = None,
     verbose_level: int = 1,
     max_training_minutes: float | None = None,
+    transformer_params: dict[str, object] | None = None,
 ) -> tuple[list[FoldResult], pd.DataFrame]:
     torch.manual_seed(random_seed)
     np.random.seed(random_seed)
@@ -814,6 +862,7 @@ def run_group_cv(
             dropout_rate=dropout_rate,
             rnn_units=rnn_units,
             time_step=time_step,
+            transformer_params=transformer_params,
         ).to(device)
 
         optimizer = (
@@ -1082,6 +1131,7 @@ def train_full_dataset(
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    transformer_params = _transformer_params_from_config(config) if config.model == "transformer" else None
     model = make_model(
         model_type=config.model,
         input_shape=input_shape,
@@ -1091,6 +1141,7 @@ def train_full_dataset(
         dropout_rate=config.dropout,
         rnn_units=config.rnn_units,
         time_step=config.time_step_labels,
+        transformer_params=transformer_params,
     ).to(device)
 
     optimizer = create_optimizer(config, model)
@@ -1634,6 +1685,7 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint_dir=checkpoint_dir if config.save_metric_checkpoints else None,
                 verbose_level=config.verbose,
                 max_training_minutes=config.max_training_minutes,
+                transformer_params=_transformer_params_from_config(config) if config.model == "transformer" else None,
             )
         except Exception as err:  # pylint: disable=broad-except
             traceback.print_exc()

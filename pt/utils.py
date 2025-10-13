@@ -132,6 +132,20 @@ class PipelineConfig:
 	feature_worker_chunk_size: int | None = 16
 	feature_parallel_min_windows: int = 32
 	dataset_force_memmap_after_build: bool = False
+	transformer_embed_dim: int = 128
+	transformer_num_layers: int = 4
+	transformer_num_heads: int = 4
+	transformer_mlp_dim: int = 256
+	transformer_dropout_rate: float = 0.1
+	transformer_use_se: bool = False
+	transformer_se_ratio: int = 16
+	transformer_koopman_latent_dim: int = 0
+	transformer_koopman_loss_weight: float = 0.0
+	transformer_use_reconstruction_head: bool = False
+	transformer_recon_weight: float = 0.0
+	transformer_recon_target: str = "signal"
+	transformer_bottleneck_dim: int | None = None
+	transformer_expand_dim: int | None = None
 
 
 @dataclass
@@ -272,8 +286,10 @@ def config_to_dict(config: PipelineConfig) -> dict[str, object]:
 
 
 def validate_config(config: PipelineConfig) -> PipelineConfig:
-	if config.model not in {"tcn", "hybrid"}:
-		raise ValueError(f"Modelo inválido '{config.model}'. Usa 'tcn' o 'hybrid'.")
+	model_name = str(config.model).lower()
+	config.model = model_name
+	if model_name not in {"tcn", "hybrid", "transformer"}:
+		raise ValueError(f"Modelo inválido '{config.model}'. Usa 'tcn', 'hybrid' o 'transformer'.")
 	if config.mode not in {"cv", "final"}:
 		raise ValueError("'mode' debe ser 'cv' o 'final'.")
 	if config.condition not in PREPROCESS_CONFIGS:
@@ -428,6 +444,34 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
 			config.feature_parallel_min_windows = 32
 	if not isinstance(config.dataset_force_memmap_after_build, bool):
 		raise ValueError("'dataset_force_memmap_after_build' debe ser True o False.")
+	config.transformer_recon_target = str(config.transformer_recon_target).lower()
+	allowed_recon_targets = {"signal"}
+	if config.transformer_recon_target not in allowed_recon_targets:
+		raise ValueError("'transformer_recon_target' debe ser 'signal'.")
+	if config.transformer_embed_dim <= 0:
+		raise ValueError("'transformer_embed_dim' debe ser > 0.")
+	if config.transformer_num_layers <= 0:
+		raise ValueError("'transformer_num_layers' debe ser >= 1.")
+	if config.transformer_num_heads <= 0:
+		raise ValueError("'transformer_num_heads' debe ser >= 1.")
+	if config.transformer_embed_dim % config.transformer_num_heads != 0:
+		raise ValueError("'transformer_embed_dim' debe ser divisible por 'transformer_num_heads'.")
+	if config.transformer_mlp_dim <= 0:
+		raise ValueError("'transformer_mlp_dim' debe ser > 0.")
+	if not (0.0 <= config.transformer_dropout_rate < 1.0):
+		raise ValueError("'transformer_dropout_rate' debe estar en [0, 1).")
+	if config.transformer_se_ratio <= 0:
+		raise ValueError("'transformer_se_ratio' debe ser > 0.")
+	if config.transformer_koopman_latent_dim < 0:
+		raise ValueError("'transformer_koopman_latent_dim' debe ser >= 0.")
+	if config.transformer_koopman_loss_weight < 0:
+		raise ValueError("'transformer_koopman_loss_weight' debe ser >= 0.")
+	if config.transformer_use_reconstruction_head and config.transformer_recon_weight <= 0:
+		raise ValueError("'transformer_recon_weight' debe ser > 0 cuando se activa la cabeza de reconstrucción.")
+	if config.transformer_bottleneck_dim is not None and config.transformer_bottleneck_dim <= 0:
+		raise ValueError("'transformer_bottleneck_dim' debe ser > 0 cuando se especifica.")
+	if config.transformer_expand_dim is not None and config.transformer_expand_dim <= 0:
+		raise ValueError("'transformer_expand_dim' debe ser > 0 cuando se especifica.")
 	return config
 
 
