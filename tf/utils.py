@@ -80,6 +80,20 @@ class PipelineConfig:
     kernel_size: int = 7
     dropout: float = 0.3
     rnn_units: int = 64
+    transformer_embed_dim: int = 128
+    transformer_num_layers: int = 4
+    transformer_num_heads: int = 4
+    transformer_mlp_dim: int = 256
+    transformer_dropout: float = 0.1
+    transformer_use_se: bool = False
+    transformer_se_ratio: int = 16
+    transformer_use_reconstruction_head: bool = False
+    transformer_recon_weight: float = 0.0
+    transformer_recon_target: str = "signal"
+    transformer_koopman_latent_dim: int = 0
+    transformer_koopman_loss_weight: float = 0.0
+    transformer_bottleneck_dim: int | None = None
+    transformer_expand_dim: int | None = None
     learning_rate: float = 1e-3
     optimizer: str = "adam"
     optimizer_weight_decay: float = 0.0
@@ -189,6 +203,23 @@ def load_config(config_path: str | Path | None) -> PipelineConfig:
             value = int(value)
         elif fdef.name == "dataset_force_memmap_after_build" and value is not None:
             value = bool(value)
+        elif fdef.name in {
+            "transformer_embed_dim",
+            "transformer_num_layers",
+            "transformer_num_heads",
+            "transformer_mlp_dim",
+            "transformer_se_ratio",
+            "transformer_koopman_latent_dim",
+            "transformer_bottleneck_dim",
+            "transformer_expand_dim",
+        } and value is not None:
+            value = int(value)
+        elif fdef.name in {
+            "transformer_dropout",
+            "transformer_recon_weight",
+            "transformer_koopman_loss_weight",
+        } and value is not None:
+            value = float(value)
         elif fdef.name == "preprocess_n_harmonics" and value is not None:
             value = int(value)
         elif fdef.name == "selected_features" and value is not None:
@@ -262,8 +293,10 @@ def config_to_dict(config: PipelineConfig) -> dict[str, object]:
 
 
 def validate_config(config: PipelineConfig) -> PipelineConfig:
-    if config.model not in {"tcn", "hybrid"}:
-        raise ValueError(f"Modelo inválido '{config.model}'. Usa 'tcn' o 'hybrid'.")
+    if config.model not in {"tcn", "hybrid", "transformer"}:
+        raise ValueError(
+            f"Modelo inválido '{config.model}'. Usa 'tcn', 'hybrid' o 'transformer'."
+        )
     if config.mode not in {"cv", "final"}:
         raise ValueError("'mode' debe ser 'cv' o 'final'.")
     if config.condition not in PREPROCESS_CONFIGS:
@@ -423,6 +456,44 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
             raise ValueError("'time_step_labels' no es compatible con 'write_tfrecords'.")
         if config.reuse_existing_tfrecords:
             raise ValueError("'time_step_labels' no es compatible con 'reuse_existing_tfrecords'.")
+    if config.model == "transformer":
+        if config.transformer_embed_dim <= 0:
+            raise ValueError("'transformer_embed_dim' debe ser > 0.")
+        if config.transformer_num_layers <= 0:
+            raise ValueError("'transformer_num_layers' debe ser > 0.")
+        if config.transformer_num_heads <= 0:
+            raise ValueError("'transformer_num_heads' debe ser > 0.")
+        if config.transformer_embed_dim % config.transformer_num_heads != 0:
+            raise ValueError("'transformer_embed_dim' debe ser divisible por 'transformer_num_heads'.")
+        if config.transformer_mlp_dim <= 0:
+            raise ValueError("'transformer_mlp_dim' debe ser > 0.")
+        if not (0.0 <= config.transformer_dropout < 1.0):
+            raise ValueError("'transformer_dropout' debe estar en [0.0, 1.0).")
+        if config.transformer_use_se and config.transformer_se_ratio <= 0:
+            raise ValueError("'transformer_se_ratio' debe ser > 0 cuando 'transformer_use_se' es True.")
+        if config.transformer_use_reconstruction_head and config.transformer_recon_weight <= 0.0:
+            raise ValueError(
+                "'transformer_recon_weight' debe ser > 0 cuando 'transformer_use_reconstruction_head' es True."
+            )
+        if config.transformer_recon_weight < 0.0:
+            raise ValueError("'transformer_recon_weight' debe ser >= 0.")
+        if config.transformer_recon_target not in {"signal"}:
+            raise ValueError("'transformer_recon_target' solamente admite 'signal'.")
+        if config.transformer_koopman_loss_weight < 0.0:
+            raise ValueError("'transformer_koopman_loss_weight' debe ser >= 0.")
+        if config.transformer_koopman_loss_weight > 0.0 and config.transformer_koopman_latent_dim <= 0:
+            raise ValueError(
+                "'transformer_koopman_latent_dim' debe ser > 0 cuando 'transformer_koopman_loss_weight' > 0."
+            )
+        if config.transformer_bottleneck_dim is not None and config.transformer_bottleneck_dim <= 0:
+            raise ValueError("'transformer_bottleneck_dim' debe ser > 0 cuando se especifica.")
+        if config.transformer_expand_dim is not None and config.transformer_expand_dim <= 0:
+            raise ValueError("'transformer_expand_dim' debe ser > 0 cuando se especifica.")
+        if (
+            config.transformer_expand_dim is not None
+            and config.transformer_bottleneck_dim is None
+        ):
+            raise ValueError("'transformer_expand_dim' requiere que 'transformer_bottleneck_dim' esté definido.")
     return config
 
 # -----------------------------------------------------------------------------

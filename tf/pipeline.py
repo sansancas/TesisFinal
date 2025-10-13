@@ -54,6 +54,7 @@ def _json_default(value: object) -> object:
 
 from models.Hybrid import build_hybrid
 from models.TCN import build_tcn
+from models.Transformer import build_transformer
 
 # -----------------------------------------------------------------------------
 # Training utilities
@@ -423,6 +424,25 @@ def safe_roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float("nan")
 
 
+def _transformer_params_from_config(config: PipelineConfig) -> dict[str, object]:
+    return {
+        "embed_dim": config.transformer_embed_dim,
+        "num_layers": config.transformer_num_layers,
+        "num_heads": config.transformer_num_heads,
+        "mlp_dim": config.transformer_mlp_dim,
+        "dropout_rate": config.transformer_dropout,
+        "use_se": config.transformer_use_se,
+        "se_ratio": config.transformer_se_ratio,
+        "use_reconstruction_head": config.transformer_use_reconstruction_head,
+        "recon_weight": config.transformer_recon_weight,
+        "recon_target": config.transformer_recon_target,
+        "koopman_latent_dim": config.transformer_koopman_latent_dim,
+        "koopman_loss_weight": config.transformer_koopman_loss_weight,
+        "bottleneck_dim": config.transformer_bottleneck_dim,
+        "expand_dim": config.transformer_expand_dim,
+    }
+
+
 def make_model(
     *,
     model_type: str,
@@ -433,6 +453,7 @@ def make_model(
     dropout_rate: float,
     rnn_units: int,
     time_step: bool,
+    transformer_params: dict[str, object] | None = None,
 ) -> tf.keras.Model:
     common_kwargs = dict(
         input_shape=input_shape,
@@ -449,7 +470,6 @@ def make_model(
             separable=False,
             se_ratio=16,
             feat_input_dim=feat_dim,
-            use_attention_pool_win=True,
             koopman_latent_dim=0,
             koopman_loss_weight=0.0,
             use_reconstruction_head=False,
@@ -464,6 +484,31 @@ def make_model(
             se_ratio=16,
             rnn_units=rnn_units,
             feat_input_dim=feat_dim,
+        )
+    if model_type == "transformer":
+        params = dict(transformer_params or {})
+        bottleneck_dim = params.get("bottleneck_dim")
+        expand_dim = params.get("expand_dim")
+        return build_transformer(
+            input_shape=input_shape,
+            num_classes=1,
+            embed_dim=int(params.get("embed_dim", 128)),
+            num_layers=int(params.get("num_layers", 4)),
+            num_heads=int(params.get("num_heads", 4)),
+            mlp_dim=int(params.get("mlp_dim", 256)),
+            dropout_rate=float(params.get("dropout_rate", dropout_rate)),
+            time_step_classification=time_step,
+            one_hot=False,
+            use_se=bool(params.get("use_se", False)),
+            se_ratio=int(params.get("se_ratio", 16)),
+            feat_input_dim=feat_dim,
+            koopman_latent_dim=int(params.get("koopman_latent_dim", 0)),
+            koopman_loss_weight=float(params.get("koopman_loss_weight", 0.0)),
+            use_reconstruction_head=bool(params.get("use_reconstruction_head", False)),
+            recon_weight=float(params.get("recon_weight", 0.0)),
+            recon_target=str(params.get("recon_target", "signal")),
+            bottleneck_dim=None if bottleneck_dim is None else int(bottleneck_dim),
+            expand_dim=None if expand_dim is None else int(expand_dim),
         )
     raise ValueError(f"Modelo no soportado: {model_type}")
 
@@ -504,6 +549,7 @@ def run_group_cv(
     checkpoint_dir: Path | None = None,
     verbose_level: int = 1,
     max_training_minutes: float | None = None,
+    transformer_params: dict[str, object] | None = None,
 ) -> tuple[list[FoldResult], pd.DataFrame]:
     sequences = data.sequences
     features = data.features
@@ -572,6 +618,7 @@ def run_group_cv(
             dropout_rate=dropout_rate,
             rnn_units=rnn_units,
             time_step=time_step,
+            transformer_params=transformer_params,
         )
         optimizer = optimizer_factory() if optimizer_factory else tf.keras.optimizers.Adam(learning_rate=1e-3)
         loss_obj: tf.keras.losses.Loss | str = loss_factory() if loss_factory else "binary_crossentropy"
@@ -750,6 +797,7 @@ def train_full_dataset(
     epoch_time_log_context: dict[str, object] | None = None,
     save_metric_checkpoints: bool = True,
     checkpoint_dir: Path | None = None,
+    transformer_params: dict[str, object] | None = None,
 ) -> tuple[tf.keras.Model, dict[str, list[float]], dict[str, float] | None, pd.DataFrame | None, StandardScaler | None]:
     train_sequences = train_data.sequences
     train_features = train_data.features
@@ -845,6 +893,7 @@ def train_full_dataset(
         dropout_rate=config.dropout,
         rnn_units=config.rnn_units,
         time_step=config.time_step_labels,
+        transformer_params=transformer_params,
     )
     optimizer = create_optimizer(config)
     loss_obj = create_loss_factory(config)()
@@ -1369,6 +1418,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n(Dry-run) Fin del proceso. No se entrenó ningún modelo.")
         return 0
 
+    transformer_params = _transformer_params_from_config(config) if config.model == "transformer" else None
+
     if config.mode == "cv":
         try:
             fold_results, predictions_df = run_group_cv(
@@ -1406,6 +1457,7 @@ def main(argv: list[str] | None = None) -> int:
                 checkpoint_dir=checkpoint_dir if config.save_metric_checkpoints else None,
                 verbose_level=config.verbose,
                 max_training_minutes=config.max_training_minutes,
+                transformer_params=transformer_params,
             )
         except Exception as err:  # pylint: disable=broad-except
             traceback.print_exc()
@@ -1437,6 +1489,7 @@ def main(argv: list[str] | None = None) -> int:
                 epoch_time_log_context=epoch_time_context_base,
                 save_metric_checkpoints=config.save_metric_checkpoints,
                 checkpoint_dir=checkpoint_dir if config.save_metric_checkpoints else None,
+                transformer_params=transformer_params,
             )
         except Exception as err:  # pylint: disable=broad-except
             traceback.print_exc()
