@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import contextlib
 import json
 import math
 import pickle
@@ -59,6 +60,67 @@ from models.Transformer import build_transformer
 # -----------------------------------------------------------------------------
 # Training utilities
 # -----------------------------------------------------------------------------
+
+
+def _evaluate_with_fallback(
+    model: tf.keras.Model,
+    inputs,
+    labels: np.ndarray,
+    *,
+    batch_size: int,
+    description: str,
+) -> tuple[dict[str, float], np.ndarray]:
+    """Run model.evaluate/predict with GPU fallback handling.
+
+    Some GPU setups (e.g., low-memory cards) may fail to place large constant tensors
+    during evaluation after training with an ``InternalError`` complaining that the
+    destination tensor is not initialized. When that happens we retry with a smaller
+    batch size and, if needed, force the evaluation on CPU to avoid tearing down the
+    whole pipeline run.
+    """
+
+    def _run(bsize: int, device: str | None = None) -> tuple[dict[str, float], np.ndarray]:
+        context = tf.device(device) if device else contextlib.nullcontext()
+        with context:
+            results = model.evaluate(
+                inputs,
+                labels,
+                batch_size=bsize,
+                verbose=0,
+                return_dict=True,
+            )
+            raw = model.predict(
+                inputs,
+                batch_size=bsize,
+                verbose=0,
+            )
+        return {name: float(value) for name, value in results.items()}, np.asarray(raw)
+
+    try:
+        return _run(batch_size)
+    except tf.errors.InternalError as exc:
+        message = str(exc)
+        if "Dst tensor is not initialized" not in message:
+            raise
+
+        reduced_batch = max(1, batch_size // 2) if batch_size and batch_size > 1 else batch_size
+        if reduced_batch and reduced_batch != batch_size:
+            print(
+                f"⚠️  {description}: error al evaluar en GPU (batch={batch_size}). "
+                f"Reintentando con batch={reduced_batch}."
+            )
+            try:
+                return _run(reduced_batch)
+            except tf.errors.InternalError as exc2:
+                message = str(exc2)
+                if "Dst tensor is not initialized" not in message:
+                    raise
+
+        print(
+            f"⚠️  {description}: reintentando evaluación en CPU por falta de memoria en GPU."
+        )
+        fallback_batch = reduced_batch or batch_size or 1
+        return _run(fallback_batch, device="/CPU:0")
 
 class EpochTimeLogger(tf.keras.callbacks.Callback):
     def __init__(
@@ -393,23 +455,79 @@ def create_metric_checkpoint_callbacks(
     has_validation: bool,
     prefix: str = "",
     verbose: int = 0,
+    save_weights_only: bool = True,
 ) -> list[tf.keras.callbacks.Callback]:
     base_dir.mkdir(parents=True, exist_ok=True)
     callbacks: list[tf.keras.callbacks.Callback] = []
+    suffix = ".weights.h5" if save_weights_only else ".keras"
     for metric in metrics:
         monitor = f"val_{metric}" if has_validation else metric
-        filepath = base_dir / f"{prefix}{metric}_best.weights.h5"
+        filepath = base_dir / f"{prefix}{metric}_best{suffix}"
         callbacks.append(
             tf.keras.callbacks.ModelCheckpoint(
                 filepath=str(filepath),
                 monitor=monitor,
                 mode="max",
                 save_best_only=True,
-                save_weights_only=True,
+                save_weights_only=save_weights_only,
                 verbose=verbose,
             )
         )
     return callbacks
+
+
+def _checkpoint_sidecar_path(checkpoint_path: Path) -> Path:
+    suffix = checkpoint_path.suffix
+    try:
+        return checkpoint_path.with_suffix(f"{suffix}.config.json")
+    except ValueError:
+        return checkpoint_path.parent / f"{checkpoint_path.name}.config.json"
+
+
+def _write_config_metadata(checkpoint_path: Path, config: PipelineConfig) -> None:
+    if not checkpoint_path.exists() or not checkpoint_path.is_file():
+        return
+    try:
+        config_json = json.dumps(config_to_dict(config), indent=2, sort_keys=True)
+    except Exception:
+        return
+
+    sidecar_path = _checkpoint_sidecar_path(checkpoint_path)
+    try:
+        sidecar_path.write_text(config_json, encoding="utf-8")
+    except Exception:
+        pass
+
+    suffix_lower = checkpoint_path.suffix.lower()
+    if suffix_lower not in {".h5", ".keras"} and not suffix_lower.endswith(".h5"):
+        return
+    try:
+        import h5py  # type: ignore
+
+        with h5py.File(checkpoint_path, "a") as h5file:
+            try:
+                h5file.attrs["pipeline_config_json"] = config_json
+            except Exception:
+                # Some HDF5 implementations require bytes; fall back to UTF-8 bytes.
+                h5file.attrs["pipeline_config_json"] = config_json.encode("utf-8")
+    except Exception:
+        pass
+
+
+def _annotate_checkpoint_directory(base_dir: Path | None, config: PipelineConfig | None) -> None:
+    if base_dir is None or config is None:
+        return
+    base_path = Path(base_dir)
+    if not base_path.exists():
+        return
+    seen: set[str] = set()
+    for pattern in ("*.weights.h5", "*.h5", "*.keras"):
+        for candidate in base_path.rglob(pattern):
+            key = str(candidate.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            _write_config_metadata(candidate, config)
 
 
 def safe_average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -550,6 +668,7 @@ def run_group_cv(
     verbose_level: int = 1,
     max_training_minutes: float | None = None,
     transformer_params: dict[str, object] | None = None,
+    config_snapshot: PipelineConfig | None = None,
 ) -> tuple[list[FoldResult], pd.DataFrame]:
     sequences = data.sequences
     features = data.features
@@ -785,6 +904,7 @@ def run_group_cv(
         )
 
     predictions_df = pd.concat(all_predictions, ignore_index=True)
+    _annotate_checkpoint_directory(checkpoint_dir, config_snapshot)
     return fold_results, predictions_df
 
 
@@ -961,6 +1081,7 @@ def train_full_dataset(
                 has_validation=has_validation,
                 prefix="final_",
                 verbose=config.verbose,
+                save_weights_only=(config.model != "transformer"),
             )
         )
 
@@ -1024,19 +1145,20 @@ def train_full_dataset(
 
     history = model.fit(**fit_kwargs)
 
+    if checkpoint_dir is not None and save_metric_checkpoints:
+        _annotate_checkpoint_directory(checkpoint_dir, config)
+
     evaluation: dict[str, float] | None = None
     val_predictions_df: pd.DataFrame | None = None
     if X_val is not None and y_val is not None:
         val_inputs = [X_val, X_val_feat] if X_val_feat is not None else X_val
-        eval_results = model.evaluate(
+        evaluation, raw_probs = _evaluate_with_fallback(
+            model,
             val_inputs,
             y_val,
             batch_size=config.batch_size,
-            verbose=0,
-            return_dict=True,
+            description="Evaluación de validación",
         )
-        evaluation = {name: float(value) for name, value in eval_results.items()}
-        raw_probs = model.predict(val_inputs, batch_size=config.batch_size, verbose=0)
         prob_matrix = _ensure_probability_matrix(raw_probs)
         prob_matrix = prob_matrix.reshape(prob_matrix.shape[0], -1)
         frame_labels = _flatten_labels_to_frames(y_val, label_mode=val_label_mode)
@@ -1101,6 +1223,7 @@ def save_final_outputs(
 
     model_path = output_dir / "model_final.keras"
     model.save(model_path)
+    _write_config_metadata(model_path, config)
 
     history_df = pd.DataFrame(history)
     history_df.insert(0, "epoch", np.arange(1, len(history_df) + 1))
@@ -1458,6 +1581,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose_level=config.verbose,
                 max_training_minutes=config.max_training_minutes,
                 transformer_params=transformer_params,
+                config_snapshot=config,
             )
         except Exception as err:  # pylint: disable=broad-except
             traceback.print_exc()
