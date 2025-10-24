@@ -7,6 +7,7 @@ If no argumento se pasa, se utilizará ``nn_pipeline_config.json`` en el directo
 
 from __future__ import annotations
 
+import os
 import contextlib
 import csv
 import contextlib
@@ -117,10 +118,74 @@ def _evaluate_with_fallback(
                     raise
 
         print(
-            f"⚠️  {description}: reintentando evaluación en CPU por falta de memoria en GPU."
+            f"⚠️  {description}: reintentando evaluación en proceso separado en CPU por falta de memoria en GPU."
         )
         fallback_batch = reduced_batch or batch_size or 1
-        return _run(fallback_batch, device="/CPU:0")
+
+        # Use a separate Python process with CUDA disabled to avoid attempting to
+        # access GPU-located variables from CPU (TF XLA known issue). We save the
+        # model and the inputs to a temp directory, run a small worker that loads
+        # them on CPU only, and returns the results.
+        import tempfile
+        import subprocess
+        import shutil
+        import sys
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="tf_eval_cpu_"))
+        try:
+            model_path = tmpdir / "model_cpu.keras"
+            # Save full model so the subprocess can load it on CPU
+            model.save(str(model_path), include_optimizer=False)
+
+            data_path = tmpdir / "data.npz"
+            # Save inputs: support single array or list/tuple of arrays
+            if isinstance(inputs, (list, tuple)):
+                np.savez(data_path, *[np.asarray(x) for x in inputs], labels=np.asarray(labels))
+            else:
+                np.savez(data_path, input_0=np.asarray(inputs), labels=np.asarray(labels))
+
+            worker_py = tmpdir / "worker.py"
+            worker_code = f"""import os
+                import json
+                import numpy as np
+                import tensorflow as tf
+
+                # Force CPU-only in the worker
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+                npz = np.load(r'{data_path}')
+                arr_keys = [k for k in npz.files if k != 'labels']
+                inputs = [npz[k] for k in arr_keys]
+                if len(inputs) == 1:
+                    inputs = inputs[0]
+                labels = npz['labels']
+
+                model = tf.keras.models.load_model(r'{model_path}')
+                res = model.evaluate(inputs, labels, batch_size={fallback_batch}, verbose=0, return_dict=True)
+                raw = model.predict(inputs, batch_size={fallback_batch}, verbose=0)
+                np.savez(r'{tmpdir / "outputs.npz"}', raw=raw)
+                # Use doubled braces to avoid outer f-string interpolation of the
+                # dict-comprehension literal. The resulting worker script should
+                # contain the dict comprehension unchanged.
+                print(json.dumps({{k:float(v) for k,v in res.items()}}))
+                """
+            worker_py.write_text(worker_code, encoding="utf-8")
+
+            env = os.environ.copy()
+            env['CUDA_VISIBLE_DEVICES'] = ''
+            proc = subprocess.run([sys.executable, str(worker_py)], cwd=str(tmpdir), env=env, capture_output=True, text=True, timeout=900)
+            if proc.returncode != 0:
+                raise RuntimeError(f"CPU worker failed (rc={proc.returncode}): {proc.stderr}\nSTDOUT:\n{proc.stdout}")
+
+            results = json.loads(proc.stdout.strip()) if proc.stdout.strip() else {}
+            outputs_np = np.load(str(tmpdir / "outputs.npz"))
+            outputs = outputs_np["raw"]
+            return results, outputs
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
 
 class EpochTimeLogger(tf.keras.callbacks.Callback):
     def __init__(
@@ -1446,6 +1511,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
+        sampling_seed_value = config.sampling_seed if config.sampling_seed is not None else config.seed
+        undersample_seed_value = (
+            config.undersample_seed
+            if config.undersample_seed is not None
+            else sampling_seed_value
+        )
         train_records, _ = collect_records_for_split(config, "train")
         train_dataset = build_windows_dataset(
             train_records,
@@ -1461,7 +1532,10 @@ def main(argv: list[str] | None = None) -> int:
             preprocess_settings=preprocess_settings,
             include_background_only=config.include_background_only_records,
             sampling_strategy=config.sampling_strategy,
-            sampling_seed=config.sampling_seed if config.sampling_seed is not None else config.seed,
+            sampling_seed=sampling_seed_value,
+            target_positive_ratio=config.undersample_target_positive_ratio,
+            target_positive_ratio_tolerance=config.undersample_target_tolerance,
+            undersample_seed=undersample_seed_value,
             tfrecord_export=export_cfg_for("train"),
             storage_mode=config.dataset_storage,
             memmap_dir=config.dataset_memmap_dir,
@@ -1491,7 +1565,10 @@ def main(argv: list[str] | None = None) -> int:
                     preprocess_settings=preprocess_settings,
                     include_background_only=config.include_background_only_records,
                     sampling_strategy=config.sampling_strategy,
-                    sampling_seed=config.sampling_seed if config.sampling_seed is not None else config.seed,
+                    sampling_seed=sampling_seed_value,
+                    target_positive_ratio=config.undersample_target_positive_ratio,
+                    target_positive_ratio_tolerance=config.undersample_target_tolerance,
+                    undersample_seed=undersample_seed_value,
                     tfrecord_export=export_cfg_for("val"),
                     storage_mode=config.dataset_storage,
                     memmap_dir=config.dataset_memmap_dir,
@@ -1520,7 +1597,10 @@ def main(argv: list[str] | None = None) -> int:
                     preprocess_settings=preprocess_settings,
                     include_background_only=config.include_background_only_records,
                     sampling_strategy=config.sampling_strategy,
-                    sampling_seed=config.sampling_seed if config.sampling_seed is not None else config.seed,
+                    sampling_seed=sampling_seed_value,
+                    target_positive_ratio=config.undersample_target_positive_ratio,
+                    target_positive_ratio_tolerance=config.undersample_target_tolerance,
+                    undersample_seed=undersample_seed_value,
                     tfrecord_export=export_cfg_for("eval"),
                     storage_mode=config.dataset_storage,
                     memmap_dir=config.dataset_memmap_dir,
