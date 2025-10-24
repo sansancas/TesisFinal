@@ -508,6 +508,25 @@ def make_model(
     raise ValueError(f"Modelo no soportado: {model_type}")
 
 
+def maybe_compile_model(model: nn.Module, *, enabled: bool, verbose: int = 0) -> nn.Module:
+    """Wrap model with torch.compile when the flag is enabled and supported."""
+    if not enabled:
+        return model
+    if not hasattr(torch, "compile"):
+        if verbose:
+            print("   ⚠️ 'jit_compile' habilitado pero torch.compile no está disponible; se continúa sin compilar.")
+        return model
+    try:
+        compiled_model = torch.compile(model)
+    except Exception as exc:  # pylint: disable=broad-except
+        if verbose:
+            print(f"   ⚠️ Falló torch.compile: {exc}; se continúa sin compilar.")
+        return model
+    if verbose:
+        print("   ✅ Modelo compilado con torch.compile.")
+    return compiled_model
+
+
 def _prepare_batch(
     batch: tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor],
     device: torch.device,
@@ -586,7 +605,8 @@ def _forward_model(
     inputs: torch.Tensor,
     feat: torch.Tensor | None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    if isinstance(model, (TCNClassifier, HybridClassifier, TransformerClassifier)):
+    base_model = getattr(model, "_orig_mod", model)
+    if isinstance(base_model, (TCNClassifier, HybridClassifier, TransformerClassifier)):
         outputs = model(inputs, feat)
     else:
         outputs = model(inputs)
@@ -800,6 +820,7 @@ def run_group_cv(
     verbose_level: int = 1,
     max_training_minutes: float | None = None,
     transformer_params: dict[str, object] | None = None,
+    jit_compile: bool = False,
 ) -> tuple[list[FoldResult], pd.DataFrame]:
     torch.manual_seed(random_seed)
     np.random.seed(random_seed)
@@ -883,6 +904,8 @@ def run_group_cv(
             time_step=time_step,
             transformer_params=transformer_params,
         ).to(device)
+
+        model = maybe_compile_model(model, enabled=jit_compile, verbose=verbose_level)
 
         optimizer = (
             optimizer_factory(model.parameters())
@@ -1163,6 +1186,8 @@ def train_full_dataset(
         time_step=config.time_step_labels,
         transformer_params=transformer_params,
     ).to(device)
+
+    model = maybe_compile_model(model, enabled=config.jit_compile, verbose=config.verbose)
 
     optimizer = create_optimizer(config, model)
     scheduler_cfg = create_scheduler_callbacks(
@@ -1721,6 +1746,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose_level=config.verbose,
                 max_training_minutes=config.max_training_minutes,
                 transformer_params=_transformer_params_from_config(config) if config.model == "transformer" else None,
+                jit_compile=config.jit_compile,
             )
         except Exception as err:  # pylint: disable=broad-except
             traceback.print_exc()
