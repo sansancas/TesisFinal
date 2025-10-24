@@ -57,6 +57,7 @@ from pipeline import (
     _compute_evaluation_metrics,
     _window_predictions,
     make_model,
+    _transformer_params_from_config,
 )
 from utils import PipelineConfig, load_config, resolve_preprocess_settings, validate_config
 from torch.utils.data import DataLoader
@@ -461,7 +462,14 @@ def _load_model_from_sources(
         if not weights_path.exists():
             raise FileNotFoundError(f"No se encontró el archivo de pesos: {weights_path}")
         raw_state = torch.load(weights_path, map_location="cpu")
+        if isinstance(raw_state, dict):
+            config_candidate = raw_state.get("config")
+            if config_candidate is not None:
+                model_config = _config_from_dict(config_candidate)
         state_dict = _extract_state_dict(raw_state)
+        transformer_params = (
+            _transformer_params_from_config(model_config) if model_config.model == "transformer" else None
+        )
         model = make_model(
             model_type=model_config.model,
             input_shape=eval_bundle.sequences.shape[1:],
@@ -471,8 +479,18 @@ def _load_model_from_sources(
             dropout_rate=model_config.dropout,
             rnn_units=model_config.rnn_units,
             time_step=model_config.time_step_labels,
+            transformer_params=transformer_params,
         ).to(device)
-        model.load_state_dict(state_dict, strict=True)
+        try:
+            model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "No se pudo cargar el checkpoint de pesos en el modelo reconstruido. "
+                "Esto suele ocurrir cuando la arquitectura o los hiperparámetros del Transformer cambiaron "
+                "desde que se entrenó el checkpoint. Usa 'model_final.pt' (modelo completo) o vuelve a entrenar "
+                "guardando checkpoints con la configuración embebida.\n"
+                f"Detalle original: {exc}"
+            ) from exc
         return model, model_config, weights_path
 
     resolved_model_path = model_path or default_model_path
@@ -506,6 +524,7 @@ def _load_model_from_sources(
         dropout_rate=model_config.dropout,
         rnn_units=model_config.rnn_units,
         time_step=model_config.time_step_labels,
+        transformer_params=_transformer_params_from_config(model_config) if model_config.model == "transformer" else None,
     ).to(device)
     model.load_state_dict(state_dict, strict=True)
     return model, model_config, resolved_model_path

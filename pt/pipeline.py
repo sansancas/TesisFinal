@@ -191,11 +191,19 @@ class EarlyStoppingState:
 
 
 class MetricCheckpoint:
-    def __init__(self, filepath: Path, metric: str, *, mode: str = "max") -> None:
+    def __init__(
+        self,
+        filepath: Path,
+        metric: str,
+        *,
+        mode: str = "max",
+        config: PipelineConfig | None = None,
+    ) -> None:
         self.filepath = Path(filepath)
         self.metric = metric
         self.mode = mode
         self.best: float | None = None
+        self._config = config
 
     def update(self, model: nn.Module, metrics: dict[str, float]) -> None:
         value = metrics.get(self.metric)
@@ -212,7 +220,14 @@ class MetricCheckpoint:
         if improved:
             self.best = value
             self.filepath.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), self.filepath)
+            if self._config is not None:
+                payload = {
+                    "state_dict": model.state_dict(),
+                    "config": config_to_dict(self._config),
+                }
+            else:
+                payload = model.state_dict()
+            torch.save(payload, self.filepath)
 
 
 class TverskyLoss(nn.Module):
@@ -389,13 +404,14 @@ def create_metric_checkpoint_callbacks(
     metrics: Sequence[str],
     has_validation: bool,
     prefix: str = "",
+    config: PipelineConfig | None = None,
 ) -> list[MetricCheckpoint]:
     base_dir.mkdir(parents=True, exist_ok=True)
     callbacks: list[MetricCheckpoint] = []
     mode = "max" if has_validation else "min"
     for metric in metrics:
         filepath = base_dir / f"{prefix}{metric}_best.pt"
-        callbacks.append(MetricCheckpoint(filepath, metric, mode=mode))
+        callbacks.append(MetricCheckpoint(filepath, metric, mode=mode, config=config))
     return callbacks
 
 
@@ -608,8 +624,11 @@ def _collect_predictions(
     with torch.no_grad():
         for batch in dataloader:
             seq, feat, _ = _prepare_batch(batch, device)
-            outputs = model(seq, feat) if isinstance(model, (TCNClassifier, HybridClassifier)) else model(seq)
-            if isinstance(outputs, (TCNOutputs, HybridOutputs)):
+            if isinstance(model, (TCNClassifier, HybridClassifier, TransformerClassifier)):
+                outputs = model(seq, feat)
+            else:
+                outputs = model(seq)
+            if isinstance(outputs, (TCNOutputs, HybridOutputs, TransformerOutputs)):
                 probs = outputs.probabilities
             else:
                 probs = torch.sigmoid(outputs)
@@ -916,6 +935,7 @@ def run_group_cv(
                 metrics=("pr_auc", "roc_auc", "precision"),
                 has_validation=True,
                 prefix=f"fold{fold_idx:02d}_",
+                config=None,
             )
 
         for epoch in range(epochs):
@@ -1207,6 +1227,7 @@ def train_full_dataset(
             metrics=("pr_auc", "roc_auc", "recall"),
             has_validation=True,
             prefix="final_",
+            config=config,
         )
 
     for epoch in range(config.epochs):

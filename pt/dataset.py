@@ -26,6 +26,7 @@ from utils import (
     BANDPASS,
     NOTCH,
     NORMALIZE,
+    TFRecordExportConfig,
 )
 
 # =================================================================================================================
@@ -185,6 +186,97 @@ def consolidate_records(primary: Iterable[Path], fallback: Iterable[Path], *, ma
         patient_counts[patient_id] += 1
         if len(selected) >= max_records:
             break
+    return selected
+
+
+def consolidate_records_with_quota(
+    primary: Iterable[Path],
+    fallback: Iterable[Path],
+    *,
+    max_records: int,
+    max_per_patient: int,
+    positive_quota: int | None = None,
+    negative_quota: int | None = None,
+) -> list[Path]:
+    if max_records <= 0:
+        return []
+
+    primary_list = list(primary)
+    fallback_list = list(fallback)
+
+    pos_candidates: list[Path] = []
+    neg_candidates: list[Path] = []
+    for candidate in primary_list + fallback_list:
+        if candidate is None:
+            continue
+        path = Path(candidate)
+        if not path.exists():
+            continue
+        csvp = path.with_name(path.stem + "_bi.csv")
+        intervals = read_intervals(csvp)
+        if intervals:
+            pos_candidates.append(path)
+        else:
+            neg_candidates.append(path)
+
+    selected: list[Path] = []
+    seen: set[str] = set()
+    patient_counts: dict[str, int] = defaultdict(int)
+
+    def _take_from(source: list[Path], limit: int | None):
+        nonlocal selected
+        if limit is None or limit <= 0:
+            return
+        for p in source:
+            if len(selected) >= max_records:
+                break
+            key = str(Path(p).resolve())
+            if key in seen:
+                continue
+            pid = p.stem.split("_")[0]
+            if max_per_patient > 0 and patient_counts[pid] >= max_per_patient:
+                continue
+            selected.append(p)
+            seen.add(key)
+            patient_counts[pid] += 1
+            if limit is not None and len([s for s in selected if s in source]) >= limit:
+                break
+
+    primary_pos = [p for p in primary_list if p in pos_candidates]
+    primary_neg = [p for p in primary_list if p in neg_candidates]
+
+    _take_from(primary_pos, positive_quota)
+    _take_from(primary_neg, negative_quota)
+
+    remaining_slots = max_records - len(selected)
+    if remaining_slots > 0:
+        for p in primary_list:
+            if len(selected) >= max_records:
+                break
+            key = str(Path(p).resolve())
+            if key in seen:
+                continue
+            pid = p.stem.split("_")[0]
+            if max_per_patient > 0 and patient_counts[pid] >= max_per_patient:
+                continue
+            selected.append(p)
+            seen.add(key)
+            patient_counts[pid] += 1
+
+    if len(selected) < max_records:
+        for p in pos_candidates + neg_candidates:
+            if len(selected) >= max_records:
+                break
+            key = str(Path(p).resolve())
+            if key in seen:
+                continue
+            pid = p.stem.split("_")[0]
+            if max_per_patient > 0 and patient_counts[pid] >= max_per_patient:
+                continue
+            selected.append(p)
+            seen.add(key)
+            patient_counts[pid] += 1
+
     return selected
 
 
@@ -1870,11 +1962,18 @@ def collect_records_for_split(config: PipelineConfig, split: str) -> tuple[list[
         include_background_only=config.include_background_only_records,
         montage=config.montage,
     )
-    records = consolidate_records(
+    pos_attr = f"max_records_{split_key}_positive"
+    neg_attr = f"max_records_{split_key}_negative"
+    positive_quota = getattr(config, pos_attr, None)
+    negative_quota = getattr(config, neg_attr, None)
+
+    records = consolidate_records_with_quota(
         discovered,
         [],
         max_records=max_records,
         max_per_patient=config.max_per_patient,
+        positive_quota=positive_quota,
+        negative_quota=negative_quota,
     )
     if not records:
         message = (

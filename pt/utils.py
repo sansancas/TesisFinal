@@ -65,6 +65,13 @@ class PipelineConfig:
 	max_records_train: int | None = None
 	max_records_val: int | None = None
 	max_records_eval: int | None = None
+	# Optional per-split quotas for positive/negative records
+	max_records_train_positive: int | None = None
+	max_records_train_negative: int | None = None
+	max_records_val_positive: int | None = None
+	max_records_val_negative: int | None = None
+	max_records_eval_positive: int | None = None
+	max_records_eval_negative: int | None = None
 	max_per_patient: int = 1
 	include_background_only_records: bool = True
 	condition: str = "filtered"
@@ -265,6 +272,15 @@ def load_config(config_path: str | Path | None) -> PipelineConfig:
 	if config.max_records_eval is None:
 		config.max_records_eval = config.max_records
 
+	# Ensure per-split quota attrs exist (None means unused)
+	for suffix in ("train", "val", "eval"):
+		pos_attr = f"max_records_{suffix}_positive"
+		neg_attr = f"max_records_{suffix}_negative"
+		if getattr(config, pos_attr, None) is None:
+			setattr(config, pos_attr, None)
+		if getattr(config, neg_attr, None) is None:
+			setattr(config, neg_attr, None)
+
 	if config.records:
 		config.records = [Path(p).expanduser().resolve() for p in config.records]
 	else:
@@ -366,6 +382,29 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
 		raise ValueError("'max_records' debe ser > 0")
 	if config.max_per_patient <= 0:
 		raise ValueError("'max_per_patient' debe ser > 0")
+
+	# Validate optional per-split positive/negative quotas
+	for split in ("train", "val", "eval"):
+		pos_attr = f"max_records_{split}_positive"
+		neg_attr = f"max_records_{split}_negative"
+		pos_val = getattr(config, pos_attr, None)
+		neg_val = getattr(config, neg_attr, None)
+		if pos_val is not None:
+			try:
+				pos_val = int(pos_val)
+			except (TypeError, ValueError):
+				raise ValueError(f"'{pos_attr}' debe ser un entero o null.")
+			if pos_val < 0:
+				raise ValueError(f"'{pos_attr}' debe ser >= 0.")
+			setattr(config, pos_attr, pos_val)
+		if neg_val is not None:
+			try:
+				neg_val = int(neg_val)
+			except (TypeError, ValueError):
+				raise ValueError(f"'{neg_attr}' debe ser un entero o null.")
+			if neg_val < 0:
+				raise ValueError(f"'{neg_attr}' debe ser >= 0.")
+			setattr(config, neg_attr, neg_val)
 	if not isinstance(config.include_background_only_records, bool):
 		raise ValueError("'include_background_only_records' debe ser True o False.")
 	if not isinstance(config.selected_features, list):
