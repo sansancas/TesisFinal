@@ -1203,6 +1203,9 @@ def build_windows_dataset(
     include_background_only: bool = False,
     sampling_strategy: str = "none",
     sampling_seed: int | None = None,
+    target_positive_ratio: float | None = None,
+    target_positive_ratio_tolerance: float = 0.0,
+    undersample_seed: int | None = None,
     tfrecord_export=None,
     storage_mode: str = "ram",
     memmap_dir: Path | str | None = None,
@@ -1236,6 +1239,10 @@ def build_windows_dataset(
     if use_memmap and sampling_strategy_lower != "none":
         raise ValueError(
             "Las estrategias de muestreo distintas de 'none' no están disponibles con storage_mode='memmap'."
+        )
+    if use_memmap and target_positive_ratio is not None:
+        raise ValueError(
+            "El undersampling por ratio objetivo no está disponible con storage_mode='memmap'."
         )
 
     if use_memmap or auto_mode:
@@ -1812,6 +1819,9 @@ def build_windows_dataset(
     window_flags = _window_level_labels(labels, label_mode=label_mode)
 
     sampling_applied = False
+    sampling_info: dict[str, object] | None = None
+    undersampling_applied = False
+    undersampling_info: dict[str, object] | None = None
     if sampling_strategy_lower != "none":
         rng = np.random.default_rng(sampling_seed)
         pos_idx = np.flatnonzero(window_flags == 1)
@@ -1836,6 +1846,12 @@ def build_windows_dataset(
                 window_flags = window_flags[selected_idx]
                 sampling_applied = True
                 pos_windows = int(window_flags.sum())
+                sampling_info = {
+                    "strategy": sampling_strategy_lower,
+                    "windows": int(selected_idx.size),
+                    "positive_windows": pos_windows,
+                    "negative_windows": int(selected_idx.size - pos_windows),
+                }
                 print(
                     f"   ↳ Stratified sampling ('balanced'): ventanas={selected_idx.size}, "
                     f"positivos={pos_windows}, negativos={int(selected_idx.size - pos_windows)}"
@@ -1843,6 +1859,207 @@ def build_windows_dataset(
         else:
             print(
                 f"⚠️  Estrategia de muestreo '{sampling_strategy_lower}' no soportada; se omite."
+            )
+
+    if target_positive_ratio is not None and window_flags.size > 0:
+        rng_seed = undersample_seed if undersample_seed is not None else sampling_seed
+        rng = np.random.default_rng(rng_seed)
+        current_ratio = float(window_flags.mean())
+        tolerance = float(target_positive_ratio_tolerance)
+        target_low = max(0.0, target_positive_ratio - tolerance)
+        target_high = min(1.0, target_positive_ratio + tolerance)
+        pos_idx = np.flatnonzero(window_flags == 1)
+        neg_idx = np.flatnonzero(window_flags == 0)
+        total_before = int(window_flags.size)
+        selected_indices: np.ndarray | None = None
+        drop_side: str | None = None
+        achieved_ratio = current_ratio
+        within_initial = target_low <= current_ratio <= target_high
+
+        if within_initial:
+            print(
+                f"   ↳ Objetivo de ratio {target_positive_ratio:.3f} ya satisfecho "
+                f"(actual {current_ratio:.3f}, tolerancia ±{tolerance:.3f})."
+            )
+        elif current_ratio > target_positive_ratio:
+            if neg_idx.size == 0:
+                print(
+                    "⚠️  No se puede reducir la positividad al objetivo; no hay ventanas negativas disponibles."
+                )
+            else:
+                drop_side = "positive"
+                P_total = int(pos_idx.size)
+                N_total = int(neg_idx.size)
+
+                def _clamp_pos(value: int) -> int:
+                    value = max(0, min(value, P_total))
+                    if P_total > 0 and value == 0:
+                        return 1
+                    return value
+
+                if target_low <= 0.0:
+                    min_keep = 0
+                else:
+                    min_keep = math.ceil((target_low / (1.0 - target_low)) * N_total)
+                if target_high >= 1.0:
+                    max_keep = P_total
+                else:
+                    max_keep = math.floor((target_high / (1.0 - target_high)) * N_total)
+                min_keep = _clamp_pos(min_keep)
+                max_keep = _clamp_pos(max_keep)
+
+                desired_center = _clamp_pos(int(round((target_positive_ratio / (1.0 - target_positive_ratio)) * N_total)))
+                candidate_counts: set[int] = {
+                    _clamp_pos(min_keep),
+                    _clamp_pos(max_keep),
+                    desired_center,
+                    _clamp_pos(min_keep - 1),
+                    _clamp_pos(max_keep + 1),
+                    P_total,
+                }
+
+                best_keep = P_total
+                best_ratio = current_ratio
+                best_within = within_initial
+                best_diff = abs(current_ratio - target_positive_ratio)
+
+                for cand in sorted(candidate_counts):
+                    total = cand + N_total
+                    if total <= 0:
+                        continue
+                    ratio_cand = cand / total
+                    within = target_low <= ratio_cand <= target_high
+                    diff = abs(ratio_cand - target_positive_ratio)
+                    better = False
+                    if within and not best_within:
+                        better = True
+                    elif within == best_within:
+                        if diff < best_diff - 1e-9:
+                            better = True
+                        elif math.isclose(diff, best_diff, rel_tol=1e-9, abs_tol=1e-9):
+                            if cand > best_keep:
+                                better = True
+                    if better:
+                        best_keep = cand
+                        best_ratio = ratio_cand
+                        best_within = within
+                        best_diff = diff
+
+                if best_keep < P_total:
+                    if best_keep <= 0:
+                        selected_pos = np.empty((0,), dtype=pos_idx.dtype)
+                    else:
+                        selected_pos = np.sort(rng.choice(pos_idx, size=best_keep, replace=False))
+                    selected_indices = np.concatenate([selected_pos, neg_idx])
+                    achieved_ratio = best_ratio
+                else:
+                    achieved_ratio = best_ratio
+        else:
+            if pos_idx.size == 0:
+                print(
+                    "⚠️  No se puede incrementar la positividad al objetivo; no hay ventanas positivas disponibles."
+                )
+            else:
+                drop_side = "negative"
+                P_total = int(pos_idx.size)
+                N_total = int(neg_idx.size)
+
+                def _clamp_neg(value: int) -> int:
+                    value = max(0, min(value, N_total))
+                    return value
+
+                if target_high >= 1.0:
+                    min_keep = 0
+                else:
+                    min_keep = math.ceil(P_total * (1.0 - target_high) / target_high)
+                if target_low <= 0.0:
+                    max_keep = N_total
+                else:
+                    max_keep = math.floor(P_total * (1.0 - target_low) / target_low)
+                min_keep = _clamp_neg(min_keep)
+                max_keep = _clamp_neg(max_keep)
+
+                desired_center = _clamp_neg(int(round(P_total * (1.0 - target_positive_ratio) / target_positive_ratio)))
+                candidate_counts: set[int] = {
+                    _clamp_neg(min_keep),
+                    _clamp_neg(max_keep),
+                    desired_center,
+                    _clamp_neg(min_keep - 1),
+                    _clamp_neg(max_keep + 1),
+                    N_total,
+                }
+
+                best_keep = N_total
+                best_ratio = current_ratio
+                best_within = within_initial
+                best_diff = abs(current_ratio - target_positive_ratio)
+
+                for cand in sorted(candidate_counts):
+                    total = P_total + cand
+                    if total <= 0:
+                        continue
+                    ratio_cand = P_total / total
+                    within = target_low <= ratio_cand <= target_high
+                    diff = abs(ratio_cand - target_positive_ratio)
+                    better = False
+                    if within and not best_within:
+                        better = True
+                    elif within == best_within:
+                        if diff < best_diff - 1e-9:
+                            better = True
+                        elif math.isclose(diff, best_diff, rel_tol=1e-9, abs_tol=1e-9):
+                            if cand > best_keep:
+                                better = True
+                    if better:
+                        best_keep = cand
+                        best_ratio = ratio_cand
+                        best_within = within
+                        best_diff = diff
+
+                if best_keep < N_total:
+                    if best_keep <= 0:
+                        selected_neg = np.empty((0,), dtype=neg_idx.dtype)
+                    else:
+                        selected_neg = np.sort(rng.choice(neg_idx, size=best_keep, replace=False))
+                    selected_indices = np.concatenate([pos_idx, selected_neg])
+                    achieved_ratio = best_ratio
+                else:
+                    achieved_ratio = best_ratio
+
+        if selected_indices is not None:
+            selected_indices = np.sort(selected_indices)
+            if selected_indices.size != total_before:
+                sequences = sequences[selected_indices]
+                labels = labels[selected_indices]
+                patients = patients[selected_indices]
+                records_arr = records_arr[selected_indices]
+                if feature_array is not None:
+                    feature_array = feature_array[selected_indices]
+                window_flags = window_flags[selected_indices]
+                undersampling_applied = True
+                dropped_windows = total_before - int(selected_indices.size)
+                pos_windows_final = int(window_flags.sum())
+                neg_windows_final = int(window_flags.size - pos_windows_final)
+                achieved_ratio = float(window_flags.mean()) if window_flags.size else 0.0
+                undersampling_info = {
+                    "target_ratio": target_positive_ratio,
+                    "tolerance": tolerance,
+                    "achieved_ratio": achieved_ratio,
+                    "dropped_windows": dropped_windows,
+                    "kept_windows": int(window_flags.size),
+                    "dropped_class": drop_side,
+                }
+                print(
+                    "   ↳ Undersampling objetivo: ventanas="
+                    f"{window_flags.size} (positivas={pos_windows_final}, negativas={neg_windows_final}), "
+                    f"ratio final={achieved_ratio:.3f} (previo {current_ratio:.3f})."
+                )
+            else:
+                achieved_ratio = current_ratio
+        elif not within_initial and drop_side is not None:
+            print(
+                f"⚠️  No se pudo ajustar la positividad al objetivo {target_positive_ratio:.3f}; "
+                f"ratio actual {achieved_ratio:.3f} permanece fuera de la tolerancia ±{tolerance:.3f}."
             )
 
     seizure_windows = count_seizure_windows(labels, label_mode=label_mode)
@@ -1866,6 +2083,10 @@ def build_windows_dataset(
             artifacts_meta.setdefault("feature_parallel_workers", int(parallel_workers))
     else:
         artifacts_meta = {}
+    if sampling_info is not None:
+        artifacts_meta["sampling"] = sampling_info
+    if undersampling_info is not None:
+        artifacts_meta["undersampling"] = undersampling_info
 
     if write_enabled and patient_acc is not None and cache_base_dir is not None:
         for patient_id in patients_needing_export:

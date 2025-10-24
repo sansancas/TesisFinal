@@ -77,6 +77,9 @@ class PipelineConfig:
 	condition: str = "filtered"
 	sampling_strategy: str = "none"
 	sampling_seed: int | None = None
+	undersample_target_positive_ratio: float | None = None
+	undersample_target_tolerance: float = 0.02
+	undersample_seed: int | None = None
 	montage: str = "ar"
 	include_features: bool = False
 	selected_features: list[str] = field(default_factory=list)
@@ -220,6 +223,10 @@ def load_config(config_path: str | Path | None) -> PipelineConfig:
 			value = int(value)
 		elif fdef.name == "dataset_force_memmap_after_build" and value is not None:
 			value = bool(value)
+		elif fdef.name in {"undersample_target_positive_ratio", "undersample_target_tolerance"} and value is not None:
+			value = float(value)
+		elif fdef.name == "undersample_seed" and value is not None:
+			value = int(value)
 		elif fdef.name == "preprocess_n_harmonics" and value is not None:
 			value = int(value)
 		elif fdef.name == "selected_features" and value is not None:
@@ -425,6 +432,24 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
 			config.sampling_seed = int(config.sampling_seed)
 		except (TypeError, ValueError) as exc:
 			raise ValueError("'sampling_seed' debe ser un entero o None.") from exc
+	if config.undersample_target_positive_ratio is not None:
+		try:
+			config.undersample_target_positive_ratio = float(config.undersample_target_positive_ratio)
+		except (TypeError, ValueError) as exc:
+			raise ValueError("'undersample_target_positive_ratio' debe ser un número en (0, 1).") from exc
+		if not (0.0 < config.undersample_target_positive_ratio < 1.0):
+			raise ValueError("'undersample_target_positive_ratio' debe estar en el rango (0, 1).")
+	try:
+		config.undersample_target_tolerance = float(config.undersample_target_tolerance)
+	except (TypeError, ValueError) as exc:
+		raise ValueError("'undersample_target_tolerance' debe ser un número.") from exc
+	if config.undersample_target_tolerance < 0.0:
+		raise ValueError("'undersample_target_tolerance' debe ser >= 0.")
+	if config.undersample_seed is not None:
+		try:
+			config.undersample_seed = int(config.undersample_seed)
+		except (TypeError, ValueError) as exc:
+			raise ValueError("'undersample_seed' debe ser un entero o None.") from exc
 	if not (0.0 <= config.final_validation_split < 1.0):
 		raise ValueError("'final_validation_split' debe estar en [0.0, 1.0).")
 	if not config.train_roots:
@@ -462,6 +487,8 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
 		raise ValueError("'dataset_memmap_dir' debe ser una ruta válida o None.")
 	if storage_mode == "memmap" and config.sampling_strategy != "none":
 		raise ValueError("'dataset_storage'='memmap' requiere 'sampling_strategy': 'none'.")
+	if storage_mode == "memmap" and config.undersample_target_positive_ratio is not None:
+		raise ValueError("'dataset_storage'='memmap' no admite 'undersample_target_positive_ratio'.")
 	if storage_mode == "auto":
 		if config.dataset_auto_memmap_threshold_mb is not None:
 			config.dataset_auto_memmap_threshold_mb = float(config.dataset_auto_memmap_threshold_mb)

@@ -1578,6 +1578,11 @@ def main(argv: list[str] | None = None) -> int:
             reuse_enabled=reuse_enabled,
         )
 
+    sampling_seed_value = config.sampling_seed if config.sampling_seed is not None else config.seed
+    undersample_seed_value = (
+        config.undersample_seed if config.undersample_seed is not None else sampling_seed_value
+    )
+
     try:
         train_records, _ = collect_records_for_split(config, "train")
         train_dataset = build_windows_dataset(
@@ -1594,7 +1599,10 @@ def main(argv: list[str] | None = None) -> int:
             preprocess_settings=preprocess_settings,
             include_background_only=config.include_background_only_records,
             sampling_strategy=config.sampling_strategy,
-            sampling_seed=config.sampling_seed if config.sampling_seed is not None else config.seed,
+            sampling_seed=sampling_seed_value,
+            target_positive_ratio=config.undersample_target_positive_ratio,
+            target_positive_ratio_tolerance=config.undersample_target_tolerance,
+            undersample_seed=undersample_seed_value,
             tfrecord_export=export_cfg_for("train"),
             storage_mode=config.dataset_storage,
             memmap_dir=config.dataset_memmap_dir,
@@ -1624,7 +1632,10 @@ def main(argv: list[str] | None = None) -> int:
                     preprocess_settings=preprocess_settings,
                     include_background_only=config.include_background_only_records,
                     sampling_strategy=config.sampling_strategy,
-                    sampling_seed=config.sampling_seed if config.sampling_seed is not None else config.seed,
+                    sampling_seed=sampling_seed_value,
+                    target_positive_ratio=config.undersample_target_positive_ratio,
+                    target_positive_ratio_tolerance=config.undersample_target_tolerance,
+                    undersample_seed=undersample_seed_value,
                     tfrecord_export=export_cfg_for("val"),
                     storage_mode=config.dataset_storage,
                     memmap_dir=config.dataset_memmap_dir,
@@ -1653,7 +1664,10 @@ def main(argv: list[str] | None = None) -> int:
                     preprocess_settings=preprocess_settings,
                     include_background_only=config.include_background_only_records,
                     sampling_strategy=config.sampling_strategy,
-                    sampling_seed=config.sampling_seed if config.sampling_seed is not None else config.seed,
+                    sampling_seed=sampling_seed_value,
+                    target_positive_ratio=config.undersample_target_positive_ratio,
+                    target_positive_ratio_tolerance=config.undersample_target_tolerance,
+                    undersample_seed=undersample_seed_value,
                     tfrecord_export=export_cfg_for("eval"),
                     storage_mode=config.dataset_storage,
                     memmap_dir=config.dataset_memmap_dir,
