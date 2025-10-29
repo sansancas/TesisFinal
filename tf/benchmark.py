@@ -18,13 +18,13 @@ partir de la configuración guardada.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import pickle
 import sys
-import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 import matplotlib
 
@@ -33,14 +33,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import h5py
 from sklearn.metrics import auc, confusion_matrix, precision_recall_curve, roc_curve
 from tensorflow.keras import Model
+
 try:
-    # Prefer tensorflow.keras export if available, else fallback to the standalone keras package
-    from tensorflow import keras as _keras
-except Exception:  # pragma: no cover - best-effort import
-    import keras as _keras
+    from tensorflow import keras as _keras  # type: ignore
+except Exception:  # pragma: no cover - fallback for standalone Keras installs
+    try:
+        import keras as _keras  # type: ignore
+    except Exception:  # pragma: no cover - keep graceful degradation
+        _keras = None  # type: ignore
 
 from dataset import (
     build_tf_dataset_from_arrays,
@@ -50,25 +52,12 @@ from dataset import (
 )
 from pipeline import (
     _flatten_labels_to_frames,
-    _transformer_params_from_config,
     _window_level_labels,
     create_loss_factory,
     create_optimizer,
     make_model,
 )
 from utils import PipelineConfig, load_config, resolve_preprocess_settings, validate_config
-
-
-@dataclass
-class CheckpointShapeHints:
-    file_shapes: dict[str, tuple[int, ...]]
-    normalized_shapes: dict[str, tuple[int, ...]]
-    expected_channels: int | None = None
-    expected_feature_dim: int | None = None
-
-
-def _normalize_weight_name(name: str) -> str:
-    return "".join(ch if ch.isalnum() else "_" for ch in name).strip("_").lower()
 
 
 @dataclass
@@ -150,10 +139,6 @@ def _parse_cli_options(argv: list[str]) -> BenchmarkOptions:
 
     model_path = Path(model_path_value).expanduser().resolve() if model_path_value else None
     weights_path = Path(weights_path_value).expanduser().resolve() if weights_path_value else None
-    if weights_path is not None and weights_path.suffix.lower() in {".keras", ".h5"} and "weights" not in weights_path.name.lower():
-        # Treat HDF5/Keras checkpoint containing full model as model_path instead of weights-only file.
-        model_path = weights_path
-        weights_path = None
 
     if model_path and weights_path:
         raise SystemExit("Proporciona solo 'model_path' o 'weights_path', no ambos a la vez.")
@@ -186,212 +171,68 @@ def _load_run_config(run_dir: Path) -> PipelineConfig:
     return config
 
 
-def _normalize_config_candidate(
-    config_like: object,
-    *,
-    base_config: PipelineConfig,
-    output_dir: Path,
-) -> PipelineConfig:
-    if isinstance(config_like, PipelineConfig):
-        cfg = validate_config(config_like)
-    elif isinstance(config_like, dict):
-        tmp_path = output_dir / "_tmp_model_config.json"
-        tmp_path.write_text(json.dumps(config_like, indent=2), encoding="utf-8")
-        try:
-            cfg = validate_config(load_config(tmp_path))
-        finally:
-            tmp_path.unlink(missing_ok=True)
-    else:
-        return base_config
-
-    cfg.output_dir = base_config.output_dir
-    if base_config.dataset_memmap_dir is not None and cfg.dataset_memmap_dir is None:
-        cfg.dataset_memmap_dir = base_config.dataset_memmap_dir
-    return cfg
-
-
-def _config_sidecar_candidates(checkpoint_path: Path) -> list[Path]:
-    suffix = checkpoint_path.suffix
-    candidates = [
-        checkpoint_path.with_suffix(f"{suffix}.config.json") if suffix else checkpoint_path.with_name(f"{checkpoint_path.name}.config.json"),
-        checkpoint_path.with_suffix(".config.json"),
-        checkpoint_path.with_suffix(f"{suffix}.json"),
-        checkpoint_path.parent / f"{checkpoint_path.name}.config.json",
+def _ensure_model_compiled(model_obj: Model, cfg: PipelineConfig) -> None:
+    if getattr(model_obj, "optimizer", None) is not None and model_obj.compiled_loss is not None:
+        return
+    optimizer = create_optimizer(cfg)
+    loss_fn = create_loss_factory(cfg)()
+    metrics = [
+        tf.keras.metrics.BinaryAccuracy(name="accuracy"),
+        tf.keras.metrics.Precision(name="precision"),
+        tf.keras.metrics.Recall(name="recall"),
+        tf.keras.metrics.AUC(name="auc"),
+        tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
     ]
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key not in seen:
-            unique.append(candidate)
-            seen.add(key)
-    return unique
-
-
-def _load_config_from_checkpoint_artifacts(
-    checkpoint_path: Path,
-    *,
-    base_config: PipelineConfig,
-    output_dir: Path,
-) -> PipelineConfig:
-    config_data: dict | None = None
-    for candidate in _config_sidecar_candidates(checkpoint_path):
-        if candidate.exists():
-            try:
-                config_data = json.loads(candidate.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            else:
-                break
-
-    if config_data is None and checkpoint_path.suffix.lower() in {".h5", ".keras"}:
-        try:
-            with h5py.File(checkpoint_path, "r") as h5file:
-                raw = h5file.attrs.get("pipeline_config_json")
-                if raw is not None:
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8")
-                    if isinstance(raw, str):
-                        config_data = json.loads(raw)
-        except Exception:
-            pass
-
-    if config_data is not None:
-        return _normalize_config_candidate(config_data, base_config=base_config, output_dir=output_dir)
-    return base_config
-
-
-def _inspect_checkpoint_shapes(weights_path: Path) -> CheckpointShapeHints:
-    file_shapes: dict[str, tuple[int, ...]] = {}
-    normalized_shapes: dict[str, tuple[int, ...]] = {}
-    expected_channels: int | None = None
-    feature_dim_candidates: list[int] = []
-    conv_channel_candidates: list[int] = []
-
-    try:
-        with h5py.File(weights_path, "r") as hf:
-            def _collect(name: str, obj: h5py.Dataset) -> None:
-                if not isinstance(obj, h5py.Dataset):
-                    return
-                key = name.rstrip(":0")
-                shape = tuple(int(dim) for dim in obj.shape)
-                file_shapes.setdefault(key, shape)
-                normalized_shapes.setdefault(_normalize_weight_name(key), shape)
-                parts = key.split("/")
-                if parts:
-                    tail1 = parts[-1]
-                    file_shapes.setdefault(tail1, shape)
-                    normalized_shapes.setdefault(_normalize_weight_name(tail1), shape)
-                if len(parts) >= 2:
-                    tail2 = "/".join(parts[-2:])
-                    file_shapes.setdefault(tail2, shape)
-                    normalized_shapes.setdefault(_normalize_weight_name(tail2), shape)
-                if len(parts) >= 3:
-                    tail3 = "/".join(parts[-3:])
-                    file_shapes.setdefault(tail3, shape)
-                    normalized_shapes.setdefault(_normalize_weight_name(tail3), shape)
-
-            hf.visititems(_collect)
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"⚠️  No se pudo inspeccionar el archivo de pesos ({weights_path}): {exc}")
-        return CheckpointShapeHints(file_shapes={}, normalized_shapes={})
-
-    for candidate_key in (
-        "conv1/depthwise_kernel",
-        "conv1_depthwise_kernel",
-        "conv1/depthwise_kernel_0",
-        "depthwise_conv2d/depthwise_kernel",
-        "depthwise_kernel",
-    ):
-        shape = file_shapes.get(candidate_key)
-        if shape is None:
-            shape = normalized_shapes.get(_normalize_weight_name(candidate_key))
-        if not shape:
-            continue
-        if len(shape) >= 2:
-            idx = 1 if len(shape) == 3 else -2 if len(shape) >= 4 else 1
-            try:
-                expected_channels = int(shape[idx])
-                break
-            except (IndexError, TypeError, ValueError):
-                continue
-
-    if expected_channels is None:
-        for key, shape in file_shapes.items():
-            if not shape:
-                continue
-            ndim = len(shape)
-            if ndim == 3:
-                kernel, channels, depth_mul = shape
-                if channels > 1 and kernel <= 21:
-                    conv_channel_candidates.append(int(channels))
-                if depth_mul > 1 and kernel == 1:
-                    conv_channel_candidates.append(int(depth_mul))
-            elif ndim == 4:
-                k0, k1, in_ch, out_ch = shape
-                if "depthwise" in key.lower():
-                    channels = in_ch
-                else:
-                    channels = in_ch if in_ch <= out_ch else out_ch
-                if channels > 1 and k0 <= 21:
-                    conv_channel_candidates.append(int(channels))
-            elif ndim == 2 and "kernel" in key.lower():
-                rows, cols = shape
-                for candidate in (rows, cols):
-                    if 1 < candidate <= 512:
-                        conv_channel_candidates.append(int(candidate))
-
-    for key, shape in file_shapes.items():
-        kl = key.lower()
-        # Detect FiLM-like parameter names. Some implementations name these
-        # layers with variants such as 'film', 'fi_lm', 'fi-lm', 'fi_lm1d', etc.
-        if shape and len(shape) == 2 and (
-            "film" in kl
-            or "fi_lm" in kl
-            or "fi-lm" in kl
-            or "fi lm" in kl
-            or kl.startswith("fi") and "lm" in kl
-        ):
-            # FiLM kernels typically have shape (feat_dim, embed_dim)
-            try:
-                feature_dim_candidates.append(int(shape[0]))
-            except (TypeError, ValueError):
-                pass
-
-    if expected_channels is None and conv_channel_candidates:
-        expected_channels = min(conv_channel_candidates)
-
-    expected_feature_dim: int | None
-    if feature_dim_candidates:
-        # Choose the most common feature dimension (FiLM layers share it)
-        values, counts = np.unique(feature_dim_candidates, return_counts=True)
-        expected_feature_dim = int(values[int(np.argmax(counts))])
-    else:
-        expected_feature_dim = None
-
-    hints = CheckpointShapeHints(
-        file_shapes=file_shapes,
-        normalized_shapes=normalized_shapes,
-        expected_channels=expected_channels,
-        expected_feature_dim=expected_feature_dim,
+    model_obj.compile(
+        optimizer=optimizer,
+        loss=loss_fn,
+        metrics=metrics,
+        jit_compile=getattr(cfg, "jit_compile", False),
     )
 
-    if hints.expected_channels is not None:
-        print(
-            f"ℹ️  Checkpoint inspeccionado: se inferieron {hints.expected_channels} canales de entrada."
-        )
-    if hints.expected_feature_dim is not None:
-        print(
-            f"ℹ️  Checkpoint inspeccionado: se inferieron {hints.expected_feature_dim} features FiLM."
-        )
 
-    return hints
+def _clone_model_to_device(model_obj: Model, target_device: str, cfg: PipelineConfig) -> Model:
+    device_key = target_device.upper()
+    if device_key.startswith("CPU"):
+        device_scope = "/CPU:0"
+    elif device_key.startswith("GPU"):
+        device_scope = "/GPU:0"
+    elif device_key.startswith("TPU"):
+        device_scope = "/TPU:0"
+    else:
+        device_scope = "/CPU:0"
+
+    weights = model_obj.get_weights()
+    with tf.device(device_scope):
+        cloned = tf.keras.models.clone_model(model_obj)
+        cloned.set_weights(weights)
+    _ensure_model_compiled(cloned, cfg)
+    return cloned
 
 
 def _ensure_device(device_arg: str | None) -> str:
     if not device_arg:
         return "GPU" if tf.config.list_physical_devices("GPU") else "CPU"
     return device_arg.upper()
+
+
+def _transformer_params_from_config(config: PipelineConfig) -> dict[str, object]:
+    return {
+        "embed_dim": config.transformer_embed_dim,
+        "num_layers": config.transformer_num_layers,
+        "num_heads": config.transformer_num_heads,
+        "mlp_dim": config.transformer_mlp_dim,
+        "dropout_rate": config.transformer_dropout,
+        "use_se": config.transformer_use_se,
+        "se_ratio": config.transformer_se_ratio,
+        "use_reconstruction_head": config.transformer_use_reconstruction_head,
+        "recon_weight": config.transformer_recon_weight,
+        "recon_target": config.transformer_recon_target,
+        "koopman_latent_dim": config.transformer_koopman_latent_dim,
+        "koopman_loss_weight": config.transformer_koopman_loss_weight,
+        "bottleneck_dim": config.transformer_bottleneck_dim,
+        "expand_dim": config.transformer_expand_dim,
+    }
 
 
 def _threshold_sequence(start: float, stop: float, step: float) -> np.ndarray:
@@ -520,14 +361,14 @@ def _candidate_checkpoint_dirs(config: PipelineConfig, run_dir: Path) -> list[Pa
 def _resolve_best_checkpoint(directories: Iterable[Path], metric: str) -> Path | None:
     sanitized_metric = metric.strip().lower().replace(" ", "_").replace("-", "_")
     name_variants = [
-        f"final_{sanitized_metric}_best.keras",
         f"final_{sanitized_metric}_best.weights.h5",
         f"final_{sanitized_metric}_best.h5",
-        f"{sanitized_metric}_best.keras",
+        f"final_{sanitized_metric}_best.keras",
         f"{sanitized_metric}_best.weights.h5",
         f"{sanitized_metric}_best.h5",
-        f"{sanitized_metric}.keras",
+        f"{sanitized_metric}_best.keras",
         f"{sanitized_metric}.weights.h5",
+        f"{sanitized_metric}.keras",
     ]
 
     visited: set[Path] = set()
@@ -543,9 +384,9 @@ def _resolve_best_checkpoint(directories: Iterable[Path], metric: str) -> Path |
                     return candidate
 
     pattern_variants = [
-        f"*{sanitized_metric}*best*.keras",
         f"*{sanitized_metric}*best*.weights.h5",
         f"*{sanitized_metric}*best*.h5",
+        f"*{sanitized_metric}*best*.keras",
     ]
     for base in directories:
         if not base.exists():
@@ -563,7 +404,7 @@ def _resolve_best_checkpoint(directories: Iterable[Path], metric: str) -> Path |
 
 def _infer_metric_from_checkpoint(path: Path) -> str | None:
     name = path.name
-    suffixes = (".weights.h5", ".h5")
+    suffixes = (".weights.h5", ".h5", ".keras")
     for suffix in suffixes:
         if name.lower().endswith(suffix):
             name = name[: -len(suffix)]
@@ -582,30 +423,27 @@ def _infer_metric_from_checkpoint(path: Path) -> str | None:
 def _discover_latest_checkpoint(directories: Iterable[Path]) -> Path | None:
     best_path: Path | None = None
     best_key: tuple[int, float] | None = None
+    seen: set[str] = set()
+    patterns = ("*.weights.h5", "*.h5", "*.keras")
 
     for base in directories:
         if not base.exists():
             continue
-        for candidate in base.rglob("*.weights.h5"):
-            if not candidate.is_file():
-                continue
-            name = candidate.name.lower()
-            is_best = 0 if "_best" in name else 1
-            mtime = -candidate.stat().st_mtime
-            key = (is_best, mtime)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_path = candidate
-        for candidate in base.rglob("*.keras"):
-            if not candidate.is_file():
-                continue
-            name = candidate.name.lower()
-            is_best = 0 if "_best" in name else 1
-            mtime = -candidate.stat().st_mtime
-            key = (is_best, mtime)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_path = candidate
+        for pattern in patterns:
+            for candidate in base.rglob(pattern):
+                if not candidate.is_file():
+                    continue
+                key_str = str(candidate.resolve())
+                if key_str in seen:
+                    continue
+                seen.add(key_str)
+                name = candidate.name.lower()
+                is_best = 0 if "_best" in name else 1
+                mtime = -candidate.stat().st_mtime
+                key = (is_best, mtime)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_path = candidate
     return best_path
 
 
@@ -906,6 +744,114 @@ def _prepare_predictions_dataframe(
     return predictions
 
 
+def _run_model_evaluation_once(
+    model: Model,
+    eval_bundle: DatasetBundle,
+    *,
+    scaler: object | None,
+    batch_size: int,
+    device_override: str | None,
+) -> tuple[dict[str, float], pd.DataFrame]:
+    context = tf.device(device_override) if device_override else contextlib.nullcontext()
+    with context:
+        tf_dataset, labels = _prepare_inputs(
+            eval_bundle,
+            scaler=scaler,
+            batch_size=batch_size,
+        )
+        metrics = model.evaluate(tf_dataset, verbose=0, return_dict=True)
+        metrics = {name: float(value) for name, value in metrics.items()}
+        predictions = _prepare_predictions_dataframe(
+            model,
+            eval_bundle,
+            tf_dataset,
+            labels,
+            batch_size=batch_size,
+        )
+    return metrics, predictions
+
+
+def _evaluate_with_memory_fallback(
+    model: Model,
+    eval_bundle: DatasetBundle,
+    *,
+    scaler: object | None,
+    initial_batch_size: int,
+    prefer_device: str,
+    get_cpu_model: Callable[[], Model] | None = None,
+) -> tuple[dict[str, float], pd.DataFrame, int, bool]:
+    batch_size = max(1, int(initial_batch_size))
+    device_override: str | None = None
+    used_cpu = False
+    oom_errors = (tf.errors.ResourceExhaustedError, tf.errors.InternalError)
+
+    while True:
+        try:
+            metrics, predictions = _run_model_evaluation_once(
+                model,
+                eval_bundle,
+                scaler=scaler,
+                batch_size=batch_size,
+                device_override=device_override,
+            )
+            return metrics, predictions, batch_size, used_cpu
+        except oom_errors as exc:
+            if device_override == "/CPU:0" or (prefer_device.upper() == "CPU" and batch_size <= 1):
+                raise
+
+            upper_message = str(exc).upper()
+            if batch_size > 1 and (
+                "OOM" in upper_message
+                or "RESOURCE_EXHAUSTED" in upper_message
+                or "OUT OF MEMORY" in upper_message
+            ):
+                next_batch = max(1, batch_size // 2)
+                if next_batch == batch_size and batch_size > 1:
+                    next_batch = batch_size - 1
+                if next_batch < batch_size:
+                    print(
+                        f"⚠️  Memoria agotada durante la evaluación (batch={batch_size}). Reintentando con batch={next_batch}."
+                    )
+                    batch_size = next_batch
+                    continue
+
+            if used_cpu:
+                raise
+
+            if get_cpu_model is None:
+                raise RuntimeError(
+                    "Memoria de GPU agotada durante la evaluación y no se pudo recargar el modelo en CPU."
+                ) from exc
+
+            print("⚠️  Memoria de GPU insuficiente; reintentando evaluación en CPU.")
+            try:
+                model = get_cpu_model()
+            except Exception as reload_error:  # pragma: no cover - delegated to caller
+                raise RuntimeError(
+                    "No se pudo preparar el modelo en CPU durante el fallback de evaluación."
+                ) from reload_error
+            device_override = "/CPU:0"
+            used_cpu = True
+            continue
+        except tf.errors.InvalidArgumentError as exc:
+            if device_override == "/CPU:0" and get_cpu_model is not None:
+                message_upper = str(exc).upper()
+                if "TRYING TO ACCESS RESOURCE" in message_upper or "LOCATED IN DEVICE" in message_upper:
+                    print(
+                        "⚠️  El modelo estaba fijado en GPU; se recargará en CPU para completar la evaluación."
+                    )
+                    try:
+                        model = get_cpu_model()
+                    except Exception as reload_error:  # pragma: no cover - delegated to caller
+                        raise RuntimeError(
+                            "Falló la preparación del modelo en CPU tras detectar recursos anclados a GPU."
+                        ) from reload_error
+                    device_override = "/CPU:0"
+                    used_cpu = True
+                    continue
+            raise
+
+
 def _load_model_from_sources(
     *,
     base_config: PipelineConfig,
@@ -915,28 +861,8 @@ def _load_model_from_sources(
     weights_path: Path | None,
     output_dir: Path,
     device: str,
-    shape_hints: CheckpointShapeHints | None = None,
 ) -> tuple[Model, PipelineConfig, Path]:
     model_config = base_config
-
-    def _compile_if_needed(model_obj: Model, cfg: PipelineConfig) -> None:
-        if getattr(model_obj, "optimizer", None) is not None and model_obj.compiled_loss is not None:
-            return
-        optimizer = create_optimizer(cfg)
-        loss_fn = create_loss_factory(cfg)()
-        metrics = [
-            tf.keras.metrics.BinaryAccuracy(name="accuracy"),
-            tf.keras.metrics.Precision(name="precision"),
-            tf.keras.metrics.Recall(name="recall"),
-            tf.keras.metrics.AUC(name="auc"),
-            tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
-        ]
-        model_obj.compile(
-            optimizer=optimizer,
-            loss=loss_fn,
-            metrics=metrics,
-            jit_compile=getattr(cfg, "jit_compile", False),
-        )
 
     strategy: tf.distribute.Strategy | None = None
     if device.startswith("TPU"):
@@ -956,72 +882,26 @@ def _load_model_from_sources(
         with strategy.scope():
             return fn()
 
-    if weights_path is not None:
-        if not weights_path.exists():
-            raise FileNotFoundError(f"No se encontró el archivo de pesos: {weights_path}")
-        model_config = _load_config_from_checkpoint_artifacts(
-            weights_path,
-            base_config=base_config,
-            output_dir=output_dir,
-        )
-        # Al cargar solo pesos necesitamos reconstruir el modelo.
+    resolved_weights_path = weights_path
+    resolved_model_path = model_path
+
+    if resolved_weights_path is not None:
+        suffix_lower = resolved_weights_path.suffix.lower()
+        is_weights_file = resolved_weights_path.name.lower().endswith(".weights.h5")
+        if resolved_weights_path.is_dir() or (suffix_lower in {".keras", ".h5"} and not is_weights_file):
+            # Treat SavedModel directories or .keras full-model artifacts as serialized models.
+            resolved_model_path = resolved_weights_path
+            resolved_weights_path = None
+
+    if resolved_weights_path is not None:
+        if not resolved_weights_path.exists():
+            raise FileNotFoundError(f"No se encontró el archivo de pesos: {resolved_weights_path}")
         transformer_params = (
             _transformer_params_from_config(model_config)
             if model_config.model == "transformer"
             else None
         )
-
-        # Before reconstructing the model, inspect the checkpoint to infer shape hints.
-        shape_info = shape_hints if shape_hints is not None else _inspect_checkpoint_shapes(weights_path)
-        file_shapes = dict(shape_info.file_shapes) if shape_info.file_shapes else {}
-        normalized_shapes = (
-            dict(shape_info.normalized_shapes) if shape_info.normalized_shapes else {}
-        )
-        expected_channels = shape_info.expected_channels
-        expected_feature_dim = shape_info.expected_feature_dim
-
-        # If the dataset has more channels than the checkpoint expects, trim them so the architecture matches.
-        current_channels = int(eval_bundle.sequences.shape[-1])
-        if expected_channels is not None and current_channels != expected_channels:
-            if current_channels > expected_channels:
-                print(
-                    f"⚠️  Ajustando ventanas de evaluación de {current_channels} a {expected_channels} canales para coincidir con el checkpoint."
-                )
-                trimmed = np.asarray(eval_bundle.sequences)[..., :expected_channels]
-                if not trimmed.flags.c_contiguous:
-                    trimmed = np.ascontiguousarray(trimmed)
-                eval_bundle.sequences = trimmed
-            else:
-                raise RuntimeError(
-                    "El checkpoint requiere más canales de los disponibles en el dataset actual. "
-                    f"Canales esperados según los pesos: {expected_channels}; disponibles: {current_channels}."
-                )
-
-        if expected_feature_dim is not None:
-            if eval_bundle.features is None:
-                raise RuntimeError(
-                    "El checkpoint incluye capas FiLM y espera features auxiliares, pero el dataset de evaluación no las contiene. "
-                    "Activa 'include_features' en la configuración o proporciona un scaler con las mismas features usadas en entrenamiento."
-                )
-            current_feat_dim = int(eval_bundle.features.shape[1])
-            if current_feat_dim != expected_feature_dim:
-                if current_feat_dim > expected_feature_dim:
-                    print(
-                        f"⚠️  Ajustando features de evaluación de {current_feat_dim} a {expected_feature_dim} dimensiones para coincidir con el checkpoint."
-                    )
-                    feat_trimmed = np.asarray(eval_bundle.features)[..., :expected_feature_dim]
-                    if not feat_trimmed.flags.c_contiguous:
-                        feat_trimmed = np.ascontiguousarray(feat_trimmed)
-                    eval_bundle.features = feat_trimmed
-                    feature_names = getattr(eval_bundle, "feature_names", None)
-                    if feature_names:
-                        eval_bundle.feature_names = list(feature_names[:expected_feature_dim])
-                else:
-                    raise RuntimeError(
-                        "El checkpoint requiere más features de las disponibles en el dataset actual. "
-                        f"Dimensión esperada según los pesos: {expected_feature_dim}; disponibles: {current_feat_dim}."
-                    )
-
+        # Al cargar solo pesos necesitamos reconstruir el modelo.
         builder = lambda: make_model(
             model_type=model_config.model,
             input_shape=eval_bundle.sequences.shape[1:],
@@ -1034,91 +914,33 @@ def _load_model_from_sources(
             transformer_params=transformer_params,
         )
         model = _maybe_in_strategy(builder)
-
-        # Compare file shapes with model weights
-        mismatches: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
-        missing_in_file: list[str] = []
-        for w in model.weights:
-            mname = w.name.split(':', 1)[0]
-            mshape = tuple(int(x) for x in w.shape)
-            normalized_mname = _normalize_weight_name(mname)
-
-            # direct match
-            fshape = file_shapes.get(mname)
-            if fshape is None:
-                fshape = normalized_shapes.get(normalized_mname)
-            if fshape is None:
-                # try to find any file key that endswith the model weight name
-                candidates = [k for k in file_shapes.keys() if k.endswith(mname)]
-                if candidates:
-                    fshape = file_shapes[candidates[0]]
-            if fshape is None:
-                # As a last resort, compare normalized suffixes (handles conv1/depthwise_kernel vs conv1_depthwise/kernel)
-                candidates = [
-                    shape for key, shape in file_shapes.items()
-                    if _normalize_weight_name(key).endswith(normalized_mname)
-                ]
-                if candidates:
-                    fshape = candidates[0]
-
-            if fshape is None:
-                missing_in_file.append(mname)
-            elif fshape != mshape:
-                mismatches.append((mname, mshape, fshape))
-
-        if mismatches or missing_in_file:
-            msg_lines: list[str] = []
-            msg_lines.append("Incompatibilidad detectada entre la arquitectura reconstruida y el archivo de pesos:")
-            if mismatches:
-                msg_lines.append("\nPesos con shapes distintas:")
-                for name, expected, found in mismatches[:20]:
-                    msg_lines.append(f" - {name}: modelo espera {expected}, archivo tiene {found}")
-            if missing_in_file:
-                msg_lines.append("\nPesos no encontrados en el archivo de pesos (posibles capas nuevas o nombres distintos):")
-                for name in missing_in_file[:50]:
-                    msg_lines.append(f" - {name}")
-
-            msg_lines.append("\nSugerencias:")
-            msg_lines.append(" - Asegúrate de reconstruir el modelo con el mismo 'config_used.json' que se usó en entrenamiento.")
-            msg_lines.append(" - Si sólo tienes 'weights' (no el modelo serializado), inspecciona el HDF5 para ver las shapes y adapta tu configuración.")
-            msg_lines.append(" - Alternativamente, si guardaste el modelo completo durante entrenamiento, carga el archivo .keras/.h5 con tf.keras.models.load_model().")
-            msg_lines.append(
-                " - Desde esta utilidad puedes forzar el uso del modelo completo con: "
-                "python -m tf.benchmark_eval run_dir=/ruta/al/run model_path=/ruta/al/run/model_final.keras"
-            )
-            msg_lines.append(
-                " - Para revisar las shapes dentro del checkpoint ejecuta un pequeño script con h5py que imprima cada dataset y su forma."
-            )
-
-            full_msg = "\n".join(msg_lines)
-            raise RuntimeError(full_msg)
-
         try:
-            model.load_weights(weights_path)
+            model.load_weights(resolved_weights_path)
         except Exception as exc:
             raise RuntimeError(
                 "No se pudieron cargar los pesos en la arquitectura reconstruida. "
-                "Verifica que la configuración del Transformer coincida con la usada durante el entrenamiento, "
-                "o carga el modelo completo (.keras) cuando esté disponible."
+                "Verifica que la configuración del modelo coincida con la usada durante el entrenamiento "
+                "o utiliza un archivo .keras con el modelo serializado completo."
             ) from exc
-        _maybe_in_strategy(lambda: _compile_if_needed(model, model_config))
-        return model, model_config, weights_path
+        _maybe_in_strategy(lambda: _ensure_model_compiled(model, model_config))
+        return model, model_config, resolved_weights_path
 
-    resolved_model_path = model_path or default_model_path
+    resolved_model_path = resolved_model_path or default_model_path
     if not resolved_model_path.exists():
         raise FileNotFoundError(f"No se encontró el modelo en {resolved_model_path}")
 
-    model_config = _load_config_from_checkpoint_artifacts(
-        resolved_model_path,
-        base_config=base_config,
-        output_dir=output_dir,
-    )
+    if resolved_model_path.is_dir():
+        model = _maybe_in_strategy(lambda: tf.keras.models.load_model(resolved_model_path))
+        config_candidate = getattr(model, "_pipeline_config", None)
+        if config_candidate is not None:
+            model_config = validate_config(config_candidate)
+            model_config.output_dir = base_config.output_dir
+        _maybe_in_strategy(lambda: _ensure_model_compiled(model, model_config))
+        return model, model_config, resolved_model_path
 
     if resolved_model_path.suffix in {".h5", ".keras"}:
-        # Try to load the serialized model providing known custom objects from our tf.models
         custom_objects: dict[str, object] = {}
         try:
-            # Import candidate custom classes/functions from our model implementations
             from tf.models.Transformer import (
                 FiLM1D,
                 MultiHeadSelfAttentionRoPE,
@@ -1127,6 +949,7 @@ def _load_model_from_sources(
                 gelu,
                 rotary_embedding,
             )
+
             custom_objects.update(
                 {
                     "FiLM1D": FiLM1D,
@@ -1138,57 +961,54 @@ def _load_model_from_sources(
                 }
             )
         except Exception:
-            # best-effort only; continue without failing if imports are unavailable
             pass
 
-        # Also try to pick up FiLM etc. from Hybrid model if present
         try:
-            from tf.models.Hybrid import FiLM1D as FiLM1D_h, AttentionPooling1D as AP_h, gelu as gelu_h
+            from tf.models.Hybrid import FiLM1D as FiLM1D_h, AttentionPooling1D as AttentionPooling1D_h, gelu as gelu_h
 
-            # Merge but don't overwrite existing keys
             if "FiLM1D" not in custom_objects:
                 custom_objects["FiLM1D"] = FiLM1D_h
             if "AttentionPooling1D" not in custom_objects:
-                custom_objects["AttentionPooling1D"] = AP_h
+                custom_objects["AttentionPooling1D"] = AttentionPooling1D_h
             if "gelu" not in custom_objects:
                 custom_objects["gelu"] = gelu_h
         except Exception:
             pass
 
-        # Attempt to load with custom_objects first. Use compile=False here and compile/compile_if_needed later.
+        load_kwargs: dict[str, object] = {"custom_objects": custom_objects, "compile": False}
+
         try:
-            model = _maybe_in_strategy(
-                lambda: tf.keras.models.load_model(resolved_model_path, custom_objects=custom_objects, compile=False)
-            )
+            model = _maybe_in_strategy(lambda: tf.keras.models.load_model(resolved_model_path, **load_kwargs))
         except ValueError as exc:
-            # Common case: Lambda layer with a python lambda is blocked by safe deserialization.
-            msg = str(exc).lower()
-            if "lambda" in msg and "lambda" in msg:
-                print("⚠️  Modelo contiene Lambda con funciones lambda; reintentando con deserialización insegura (unsafe).")
+            message = str(exc).lower()
+            if "lambda" in message:
+                print(
+                    "⚠️  Modelo contiene capas Lambda con funciones Python; se intentará cargar con deserialización insegura."
+                )
+                unsafe_kwargs = dict(load_kwargs)
+                # Prefer explicit safe_mode when supported.
                 try:
-                    # Try to enable unsafe deserialization (best-effort)
-                    try:
-                        _keras.config.enable_unsafe_deserialization()
-                    except Exception:
-                        # Older/newer APIs may accept safe_mode=False in load_model; fall back to that below
-                        pass
                     model = _maybe_in_strategy(
-                        lambda: tf.keras.models.load_model(resolved_model_path, compile=False)
+                        lambda: tf.keras.models.load_model(
+                            resolved_model_path,
+                            safe_mode=False,
+                            **unsafe_kwargs,
+                        )
                     )
-                except Exception:
-                    # If it still fails, re-raise the original error for visibility
-                    raise
+                except TypeError:
+                    if _keras is not None:
+                        try:
+                            _keras.config.enable_unsafe_deserialization()
+                        except Exception:
+                            pass
+                    model = _maybe_in_strategy(lambda: tf.keras.models.load_model(resolved_model_path, **unsafe_kwargs))
             else:
-                # Re-raise unexpected ValueErrors
                 raise
         config_candidate = getattr(model, "_pipeline_config", None)
         if config_candidate is not None:
-            model_config = _normalize_config_candidate(
-                config_candidate,
-                base_config=base_config,
-                output_dir=output_dir,
-            )
-        _maybe_in_strategy(lambda: _compile_if_needed(model, model_config))
+            model_config = validate_config(config_candidate)
+            model_config.output_dir = base_config.output_dir
+        _maybe_in_strategy(lambda: _ensure_model_compiled(model, model_config))
         return model, model_config, resolved_model_path
 
     raise RuntimeError(
@@ -1211,8 +1031,20 @@ def _prepare_eval_predictions(
     predictions_path = run_dir / "final_eval_predictions.csv"
     metrics: dict[str, float] = {}
     default_model_path = run_dir / "model_final.keras"
-    auto_model_path = model_path.expanduser() if model_path is not None else None
-    auto_weights_path = weights_path.expanduser() if weights_path is not None else None
+    requested_model_path = model_path.expanduser() if model_path is not None else None
+    requested_weights_path = weights_path.expanduser() if weights_path is not None else None
+
+    if requested_weights_path is not None:
+        suffix_lower = requested_weights_path.suffix.lower()
+        is_weights = requested_weights_path.name.lower().endswith(".weights.h5")
+        if requested_weights_path.is_dir() or (suffix_lower in {".keras", ".h5"} and not is_weights):
+            if requested_model_path is not None:
+                raise SystemExit("Proporciona solo 'model_path' o 'weights_path', no ambos.")
+            requested_model_path = requested_weights_path
+            requested_weights_path = None
+
+    auto_model_path = requested_model_path
+    auto_weights_path = requested_weights_path
     checkpoint_metric_used: Optional[str] = None
     checkpoint_dirs = _candidate_checkpoint_dirs(config, run_dir)
 
@@ -1263,9 +1095,12 @@ def _prepare_eval_predictions(
                     )
                 )
 
-    if auto_weights_path is not None and auto_weights_path.suffix.lower() in {".keras", ".h5"} and "weights" not in auto_weights_path.name.lower():
-        auto_model_path = auto_weights_path
-        auto_weights_path = None
+    if auto_weights_path is not None:
+        suffix_lower = auto_weights_path.suffix.lower()
+        is_weights = auto_weights_path.name.lower().endswith(".weights.h5")
+        if auto_weights_path.is_dir() or (suffix_lower in {".keras", ".h5"} and not is_weights):
+            auto_model_path = auto_weights_path
+            auto_weights_path = None
 
     resolved_model_path = (auto_model_path or default_model_path).expanduser()
     if resolved_model_path.exists():
@@ -1273,7 +1108,7 @@ def _prepare_eval_predictions(
     model_source: Path = auto_weights_path or resolved_model_path
 
     if predictions_path.exists() and not force_recompute:
-        if auto_weights_path == weights_path and auto_model_path == model_path:
+        if auto_weights_path == requested_weights_path and auto_model_path == requested_model_path:
             df = pd.read_csv(predictions_path)
             if {"y_true", "y_prob", "record"}.issubset(df.columns):
                 return df, metrics, model_source, None
@@ -1281,14 +1116,6 @@ def _prepare_eval_predictions(
     if auto_weights_path is None and not resolved_model_path.exists():
         raise FileNotFoundError(
             f"No se encontró un modelo serializado ni checkpoints (.weights.h5) en {run_dir}.")
-
-    inspect_candidate: Path | None = None
-    if auto_weights_path is not None and auto_weights_path.exists():
-        inspect_candidate = auto_weights_path
-    elif resolved_model_path.exists() and resolved_model_path.suffix.lower() in {".keras", ".h5"}:
-        inspect_candidate = resolved_model_path
-
-    shape_hints = _inspect_checkpoint_shapes(inspect_candidate) if inspect_candidate else None
 
     eval_records, _ = collect_records_for_split(config, "eval")
     if not eval_records:
@@ -1303,22 +1130,11 @@ def _prepare_eval_predictions(
     ):
         auto_threshold_bytes = int(config.dataset_auto_memmap_threshold_mb * 1024 * 1024)
 
-    eval_include_features = config.include_features
-    if (
-        shape_hints is not None
-        and shape_hints.expected_feature_dim is not None
-        and not eval_include_features
-    ):
-        print(
-            "ℹ️  El checkpoint indica capas FiLM; se habilitan automáticamente las features en evaluación."
-        )
-        eval_include_features = True
-
     eval_bundle = build_windows_dataset(
         eval_records,
         condition=config.condition,
         montage=config.montage,
-        include_features=eval_include_features,
+        include_features=config.include_features,
         time_step_labels=config.time_step_labels,
         feature_subset=config.selected_features or None,
         window_sec=config.window_sec,
@@ -1340,7 +1156,7 @@ def _prepare_eval_predictions(
         force_memmap_after_build=False,
     )
 
-    model, _model_config, model_source = _load_model_from_sources(
+    model, model_config, model_source = _load_model_from_sources(
         base_config=config,
         eval_bundle=eval_bundle,
         default_model_path=default_model_path,
@@ -1348,7 +1164,6 @@ def _prepare_eval_predictions(
         weights_path=auto_weights_path,
         output_dir=output_dir,
         device=device,
-        shape_hints=shape_hints,
     )
 
     scaler_dirs: list[Path] = [run_dir, *checkpoint_dirs]
@@ -1367,22 +1182,40 @@ def _prepare_eval_predictions(
             scaler = None
 
     eval_batch_size = batch_size or config.batch_size
-    tf_dataset, labels = _prepare_inputs(
-        eval_bundle,
-        scaler=scaler,
-        batch_size=eval_batch_size,
-    )
 
-    raw_metrics = model.evaluate(tf_dataset, verbose=0, return_dict=True)
-    raw_metrics = {name: float(value) for name, value in raw_metrics.items()}
+    def _prepare_cpu_model() -> Model:
+        nonlocal model, model_config
+        try:
+            cpu_model = _clone_model_to_device(model, "CPU", model_config)
+        except Exception as clone_error:  # pylint: disable=broad-except
+            print("⚠️  No se pudo clonar el modelo a CPU; se recargará desde disco.")
+            refreshed_model, refreshed_config, _ = _load_model_from_sources(
+                base_config=config,
+                eval_bundle=eval_bundle,
+                default_model_path=default_model_path,
+                model_path=auto_model_path,
+                weights_path=auto_weights_path,
+                output_dir=output_dir,
+                device="CPU",
+            )
+            model = refreshed_model
+            model_config = refreshed_config
+            return refreshed_model
+        model = cpu_model
+        return cpu_model
 
-    predictions = _prepare_predictions_dataframe(
+    raw_metrics, predictions, effective_batch, used_cpu = _evaluate_with_memory_fallback(
         model,
         eval_bundle,
-        tf_dataset,
-        labels,
-        batch_size=eval_batch_size,
+        scaler=scaler,
+        initial_batch_size=eval_batch_size,
+        prefer_device=device,
+        get_cpu_model=_prepare_cpu_model,
     )
+    if effective_batch != eval_batch_size:
+        print(f"ℹ️  Batch de evaluación ajustado a {effective_batch} por limitaciones de memoria.")
+    if used_cpu:
+        print("ℹ️  La evaluación final se realizó en CPU debido a memoria insuficiente en GPU.")
     predictions.to_csv(predictions_path, index=False)
     return predictions, raw_metrics, model_source, checkpoint_metric_used
 
