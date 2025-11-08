@@ -418,17 +418,39 @@ def _plot_training_curves(history_df: pd.DataFrame, output_dir: Path) -> dict[st
 
 def _extract_state_dict(checkpoint: object) -> dict[str, torch.Tensor]:
     if isinstance(checkpoint, nn.Module):
-        return checkpoint.state_dict()
+        state_dict = checkpoint.state_dict()
+        return _sanitize_state_dict_keys(state_dict)
     if isinstance(checkpoint, dict):
         for key in ("state_dict", "model_state_dict", "weights", "model"):
             value = checkpoint.get(key)
             if isinstance(value, dict):
-                return value
+                return _sanitize_state_dict_keys(value)
         if checkpoint and all(isinstance(k, str) for k in checkpoint.keys()) and all(
             torch.is_tensor(v) for v in checkpoint.values()
         ):
-            return checkpoint
+            return _sanitize_state_dict_keys(checkpoint)
     raise RuntimeError("No se pudo extraer un state_dict del checkpoint proporcionado.")
+
+
+def _sanitize_state_dict_keys(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Normaliza prefijos comunes en checkpoints (p.ej. _orig_mod. o module.)."""
+    if not state_dict:
+        return state_dict
+
+    prefixes = ["_orig_mod.", "module."]
+    cleaned: dict[str, torch.Tensor] = dict(state_dict)
+    for prefix in prefixes:
+        if any(key.startswith(prefix) for key in cleaned.keys()):
+            stripped: dict[str, torch.Tensor] = {}
+            for key, value in cleaned.items():
+                new_key = key[len(prefix) :] if key.startswith(prefix) else key
+                if new_key in stripped:
+                    raise RuntimeError(
+                        "El checkpoint contiene claves duplicadas tras eliminar prefijos conocidos."
+                    )
+                stripped[new_key] = value
+            cleaned = stripped
+    return cleaned
 
 
 def _load_model_from_sources(
