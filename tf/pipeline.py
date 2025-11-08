@@ -2,7 +2,7 @@
 """
 Usage example:
     python run_nn_pipeline.py path/al/config.json
-If no argumento se pasa, se utilizará ``nn_pipeline_config.json`` en el directorio actual.
+If no argumento se pasa, se utilizará ``cfg.json`` en el directorio actual.
 """
 
 from __future__ import annotations
@@ -637,7 +637,17 @@ def make_model(
     rnn_units: int,
     time_step: bool,
     transformer_params: dict[str, object] | None = None,
+    use_input_se_block: bool = False,
+    input_se_ratio: int = 8,
+    use_input_conv_block: bool = False,
+    input_conv_filters: int = 32,
+    input_conv_kernel_size: int = 5,
+    input_conv_layers: int = 0,
+    feature_enricher_units: Sequence[int] | None = None,
+    feature_enricher_activation: str = "relu",
+    feature_enricher_dropout: float = 0.0,
 ) -> tf.keras.Model:
+    feature_units: tuple[int, ...] = tuple(int(u) for u in (feature_enricher_units or []) if int(u) > 0)
     common_kwargs = dict(
         input_shape=input_shape,
         num_classes=1,
@@ -656,6 +666,15 @@ def make_model(
             koopman_latent_dim=0,
             koopman_loss_weight=0.0,
             use_reconstruction_head=False,
+            use_input_se_block=use_input_se_block,
+            input_se_ratio=input_se_ratio,
+            use_input_conv_block=use_input_conv_block,
+            input_conv_filters=input_conv_filters,
+            input_conv_kernel_size=input_conv_kernel_size,
+            input_conv_layers=input_conv_layers,
+            feature_enricher_units=feature_units,
+            feature_enricher_activation=feature_enricher_activation,
+            feature_enricher_dropout=feature_enricher_dropout,
         )
     if model_type == "hybrid":
         return build_hybrid(
@@ -667,6 +686,15 @@ def make_model(
             se_ratio=16,
             rnn_units=rnn_units,
             feat_input_dim=feat_dim,
+            use_input_se_block=use_input_se_block,
+            input_se_ratio=input_se_ratio,
+            use_input_conv_block=use_input_conv_block,
+            input_conv_filters=input_conv_filters,
+            input_conv_kernel_size=input_conv_kernel_size,
+            input_conv_layers=input_conv_layers,
+            feature_enricher_units=feature_units,
+            feature_enricher_activation=feature_enricher_activation,
+            feature_enricher_dropout=feature_enricher_dropout,
         )
     if model_type == "transformer":
         params = dict(transformer_params or {})
@@ -692,6 +720,15 @@ def make_model(
             recon_target=str(params.get("recon_target", "signal")),
             bottleneck_dim=None if bottleneck_dim is None else int(bottleneck_dim),
             expand_dim=None if expand_dim is None else int(expand_dim),
+            use_input_se_block=use_input_se_block,
+            input_se_ratio=input_se_ratio,
+            use_input_conv_block=use_input_conv_block,
+            input_conv_filters=input_conv_filters,
+            input_conv_kernel_size=input_conv_kernel_size,
+            input_conv_layers=input_conv_layers,
+            feature_enricher_units=feature_units,
+            feature_enricher_activation=feature_enricher_activation,
+            feature_enricher_dropout=feature_enricher_dropout,
         )
     raise ValueError(f"Modelo no soportado: {model_type}")
 
@@ -803,6 +840,15 @@ def run_group_cv(
             rnn_units=rnn_units,
             time_step=time_step,
             transformer_params=transformer_params,
+            use_input_se_block=config_snapshot.use_input_se_block if config_snapshot else False,
+            input_se_ratio=config_snapshot.input_se_ratio if config_snapshot else 8,
+            use_input_conv_block=config_snapshot.use_input_conv_block if config_snapshot else False,
+            input_conv_filters=config_snapshot.input_conv_filters if config_snapshot else 32,
+            input_conv_kernel_size=config_snapshot.input_conv_kernel_size if config_snapshot else 5,
+            input_conv_layers=config_snapshot.input_conv_layers if config_snapshot else 0,
+            feature_enricher_units=(config_snapshot.feature_enricher_units if config_snapshot else ()),
+            feature_enricher_activation=(config_snapshot.feature_enricher_activation if config_snapshot else "relu"),
+            feature_enricher_dropout=(config_snapshot.feature_enricher_dropout if config_snapshot else 0.0),
         )
         optimizer = optimizer_factory() if optimizer_factory else tf.keras.optimizers.Adam(learning_rate=1e-3)
         loss_obj: tf.keras.losses.Loss | str = loss_factory() if loss_factory else "binary_crossentropy"
@@ -1079,6 +1125,15 @@ def train_full_dataset(
         rnn_units=config.rnn_units,
         time_step=config.time_step_labels,
         transformer_params=transformer_params,
+        use_input_se_block=config.use_input_se_block,
+        input_se_ratio=config.input_se_ratio,
+        use_input_conv_block=config.use_input_conv_block,
+        input_conv_filters=config.input_conv_filters,
+        input_conv_kernel_size=config.input_conv_kernel_size,
+        input_conv_layers=config.input_conv_layers,
+        feature_enricher_units=config.feature_enricher_units,
+        feature_enricher_activation=config.feature_enricher_activation,
+        feature_enricher_dropout=config.feature_enricher_dropout,
     )
     optimizer = create_optimizer(config)
     loss_obj = create_loss_factory(config)()

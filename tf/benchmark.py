@@ -912,6 +912,15 @@ def _load_model_from_sources(
             rnn_units=model_config.rnn_units,
             time_step=model_config.time_step_labels,
             transformer_params=transformer_params,
+            use_input_se_block=getattr(model_config, "use_input_se_block", False),
+            input_se_ratio=getattr(model_config, "input_se_ratio", 8),
+            use_input_conv_block=getattr(model_config, "use_input_conv_block", False),
+            input_conv_filters=getattr(model_config, "input_conv_filters", 32),
+            input_conv_kernel_size=getattr(model_config, "input_conv_kernel_size", 5),
+            input_conv_layers=getattr(model_config, "input_conv_layers", 0),
+            feature_enricher_units=getattr(model_config, "feature_enricher_units", []),
+            feature_enricher_activation=getattr(model_config, "feature_enricher_activation", "relu"),
+            feature_enricher_dropout=getattr(model_config, "feature_enricher_dropout", 0.0),
         )
         model = _maybe_in_strategy(builder)
         try:

@@ -13,6 +13,15 @@ def se_block_1d(x, se_ratio=16, name="se"):
     s = layers.Reshape((1, ch), name=f"{name}_rs")(s)
     return layers.Multiply(name=f"{name}_sc")([x, s])
 
+
+def _apply_feature_enricher(feat, units, activation, dropout, prefix):
+    out = feat
+    for idx, dim in enumerate(units):
+        out = layers.Dense(dim, activation=activation, name=f"{prefix}_dense{idx+1}")(out)
+        if dropout > 0.0:
+            out = layers.Dropout(dropout, name=f"{prefix}_drop{idx+1}")(out)
+    return out
+
 class FiLM1D(layers.Layer):
     def __init__(self, channels, name=None):
         super().__init__(name=name)
@@ -95,6 +104,15 @@ def build_tcn(input_shape,
                 se_ratio=16,
                 cycle_dilations=(1,2,4,8),
                 feat_input_dim: int | None = None,
+                use_input_se_block: bool = False,
+                input_se_ratio: int = 8,
+                use_input_conv_block: bool = False,
+                input_conv_filters: int = 32,
+                input_conv_kernel_size: int = 5,
+                input_conv_layers: int = 0,
+                feature_enricher_units: tuple[int, ...] = (),
+                feature_enricher_activation: str = "relu",
+                feature_enricher_dropout: float = 0.0,
                 use_attention_pool_win=True,
                 # === Koopman head ===
                 koopman_latent_dim: int = 0,         # 0 = desactivado
@@ -117,12 +135,33 @@ def build_tcn(input_shape,
     Inp = layers.Input(shape=input_shape, dtype=dtype, name="input")
     x = Inp
 
+    if use_input_conv_block and input_conv_layers > 0:
+        filters = max(1, int(input_conv_filters))
+        for idx in range(int(input_conv_layers)):
+            x = layers.Conv1D(filters, input_conv_kernel_size, padding="same", name=f"preconv{idx+1}")(x)
+            x = layers.BatchNormalization(name=f"preconv{idx+1}_bn")(x)
+            x = layers.Activation(gelu, name=f"preconv{idx+1}_act")(x)
+
+    if use_input_se_block:
+        x = se_block_1d(x, se_ratio=input_se_ratio, name="se_input")
+
     # FiLM temprano si hay features globales
     feat_in = None
+    feat_mod = None
     if feat_input_dim is not None and feat_input_dim > 0:
         # FiLM1D ya está definido en tu archivo original
         feat_in = layers.Input(shape=(feat_input_dim,), name="feat_input")
-        x = FiLM1D(channels=input_shape[-1], name="film_in")(x, feat_in)
+        feat_mod = _apply_feature_enricher(
+            feat_in,
+            feature_enricher_units,
+            feature_enricher_activation,
+            feature_enricher_dropout,
+            "feat_enricher",
+        )
+        film_channels = int(x.shape[-1]) if x.shape[-1] is not None else int(input_shape[-1])
+        x = FiLM1D(channels=film_channels, name="film_in")(x, feat_mod)
+
+    feat_for_film = feat_mod if feat_mod is not None else feat_in
 
     skips = []
     for i in range(num_blocks):
@@ -169,7 +208,7 @@ def build_tcn(input_shape,
         h = layers.Conv1D(num_filters, 1, padding="same", name="head_ts_proj")(s_sum)
         h = layers.LayerNormalization(name="head_ts_ln")(h)
         if feat_input_dim is not None and feat_input_dim > 0:
-            h = FiLM1D(channels=num_filters, name="film_ts")(h, feat_in)
+            h = FiLM1D(channels=num_filters, name="film_ts")(h, feat_for_film)
         # Bottleneck/expansión (time-step)
         if bottleneck_dim:
             h = layers.Conv1D(bottleneck_dim, 1, padding="same", activation=activations.gelu, name="bneck_ts")(h)
@@ -198,7 +237,7 @@ def build_tcn(input_shape,
             h = layers.Dense(num_filters, activation=activations.gelu, name="head_fc")(h)
             h = layers.Dropout(dropout_rate, name="head_fc_drop")(h)
             h = layers.Reshape((1, num_filters), name="head_rs")(h)
-            h = FiLM1D(channels=num_filters, name="film_win")(h, feat_in)
+            h = FiLM1D(channels=num_filters, name="film_win")(h, feat_for_film)
             h = layers.Reshape((num_filters,), name="head_flat")(h)
             inputs = [Inp, feat_in]
         else:

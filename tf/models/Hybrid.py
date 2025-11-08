@@ -14,6 +14,15 @@ def se_block_1d(x, se_ratio=16, name="se"):
     s = layers.Reshape((1, ch), name=f"{name}_reshape")(s)
     return layers.Multiply(name=f"{name}_scale")([x, s])
 
+
+def _apply_feature_enricher(feat, units, activation, dropout, prefix):
+    out = feat
+    for idx, dim in enumerate(units):
+        out = layers.Dense(dim, activation=activation, name=f"{prefix}_dense{idx+1}")(out)
+        if dropout > 0.0:
+            out = layers.Dropout(dropout, name=f"{prefix}_drop{idx+1}")(out)
+    return out
+
 @tf.keras.utils.register_keras_serializable()
 class FiLM1D(layers.Layer):
     def __init__(self, channels, name=None, **kwargs):
@@ -65,6 +74,15 @@ def build_hybrid(
     num_heads=4,
     rnn_units=64,
     feat_input_dim: int | None = None,
+    use_input_se_block: bool = False,
+    input_se_ratio: int = 8,
+    use_input_conv_block: bool = False,
+    input_conv_filters: int = 32,
+    input_conv_kernel_size: int = 5,
+    input_conv_layers: int = 0,
+    feature_enricher_units: tuple[int, ...] = (),
+    feature_enricher_activation: str = "relu",
+    feature_enricher_dropout: float = 0.0,
     use_se_after_cnn=True,
     use_se_after_rnn=True,
     use_between_attention=True,
@@ -90,6 +108,16 @@ def build_hybrid(
     Inp = layers.Input(shape=input_shape, name="input")        # (T,C)
     x = Inp
 
+    if use_input_conv_block and input_conv_layers > 0:
+        filters = max(1, int(input_conv_filters))
+        for idx in range(int(input_conv_layers)):
+            x = layers.Conv1D(filters, input_conv_kernel_size, padding="same", name=f"preconv{idx+1}")(x)
+            x = layers.BatchNormalization(name=f"preconv{idx+1}_bn")(x)
+            x = layers.Activation(gelu, name=f"preconv{idx+1}_act")(x)
+
+    if use_input_se_block:
+        x = se_block_1d(x, se_ratio=input_se_ratio, name="se_input")
+
     # --- Front-end CNN (elige tipo) ---
     Conv = layers.Conv1D if conv_type == "conv" else layers.SeparableConv1D
     x = Conv(num_filters, kernel_size, padding="same", name="conv1")(x)
@@ -105,9 +133,20 @@ def build_hybrid(
 
     # --- FiLM temprano (opcional) ---
     feat_in = None
+    feat_mod = None
     if feat_input_dim is not None and feat_input_dim > 0:
         feat_in = layers.Input(shape=(feat_input_dim,), name="feat_input")
-        x = FiLM1D(channels=x.shape[-1], name="film_after_cnn")(x, feat_in)
+        feat_mod = _apply_feature_enricher(
+            feat_in,
+            feature_enricher_units,
+            feature_enricher_activation,
+            feature_enricher_dropout,
+            "feat_enricher",
+        )
+        film_channels = int(x.shape[-1]) if x.shape[-1] is not None else int(input_shape[-1])
+        x = FiLM1D(channels=film_channels, name="film_in")(x, feat_mod)
+
+    feat_for_film = feat_mod if feat_mod is not None else feat_in
 
     # --- RNN 1: Bidireccional, mantiene secuencia ---
     x = layers.Bidirectional(
@@ -195,7 +234,7 @@ def build_hybrid(
             if expand_dim:
                 x = layers.Conv1D(expand_dim, 1, padding="same", activation="relu", name="expand_ts")(x)
         if feat_input_dim is not None and feat_input_dim > 0:
-            x = FiLM1D(channels=x.shape[-1], name="film_head_ts")(x, feat_in)
+            x = FiLM1D(channels=x.shape[-1], name="film_head_ts")(x, feat_for_film)
             inputs = [Inp, feat_in]
         else:
             inputs = Inp
@@ -214,7 +253,7 @@ def build_hybrid(
             x = layers.Dense(128, activation="relu", name="fc_win")(x)
             x = layers.Dropout(dropout_rate, name="drop_win")(x)
             x = layers.Lambda(lambda t: K.expand_dims(t, axis=1), name="expand_win")(x)
-            x = FiLM1D(channels=x.shape[-1], name="film_head_win")(x, feat_in)
+            x = FiLM1D(channels=x.shape[-1], name="film_head_win")(x, feat_for_film)
             x = layers.Reshape((-1,), name="flatten_win")(x)
             inputs = [Inp, feat_in]
         else:

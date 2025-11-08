@@ -11,6 +11,15 @@ def se_block_1d(x, se_ratio=16, name="se"):
     s = layers.Reshape((1, ch), name=f"{name}_reshape")(s)
     return layers.Multiply(name=f"{name}_scale")([x, s])
 
+
+def _apply_feature_enricher(feat, units, activation, dropout, prefix):
+    out = feat
+    for idx, dim in enumerate(units):
+        out = layers.Dense(dim, activation=activation, name=f"{prefix}_dense{idx+1}")(out)
+        if dropout > 0.0:
+            out = layers.Dropout(dropout, name=f"{prefix}_drop{idx+1}")(out)
+    return out
+
 # ---------- Utilidades ----------
 def gelu(x):
     return activations.gelu(x)
@@ -203,6 +212,15 @@ def build_transformer(
     use_se=False,     # si quieres enchufar tu se_block_1d
     se_ratio=16,
     feat_input_dim=None,  # dim de features contextuales por ventana/sesión
+    use_input_se_block: bool = False,
+    input_se_ratio: int = 8,
+    use_input_conv_block: bool = False,
+    input_conv_filters: int = 32,
+    input_conv_kernel_size: int = 5,
+    input_conv_layers: int = 0,
+    feature_enricher_units: tuple[int, ...] = (),
+    feature_enricher_activation: str = "relu",
+    feature_enricher_dropout: float = 0.0,
     # ===== NUEVO: Koopman head =====
     koopman_latent_dim: int = 0,         # 0 = desactivado
     koopman_loss_weight: float = 0.0,    # e.g., 0.1
@@ -216,6 +234,16 @@ def build_transformer(
 ):
     inp = layers.Input(shape=input_shape, name="input")
     x = inp
+
+    if use_input_conv_block and input_conv_layers > 0:
+        filters = max(1, int(input_conv_filters))
+        for idx in range(int(input_conv_layers)):
+            x = layers.Conv1D(filters, input_conv_kernel_size, padding="same", name=f"preconv{idx+1}")(x)
+            x = layers.BatchNormalization(name=f"preconv{idx+1}_bn")(x)
+            x = layers.Activation(gelu, name=f"preconv{idx+1}_act")(x)
+
+    if use_input_se_block:
+        x = se_block_1d(x, se_ratio=input_se_ratio, name="se_input")
 
     # Front-end (separable) con BN+GELU
     x = layers.SeparableConv1D(64, 7, strides=2, padding="same", name="conv1")(x)
@@ -239,15 +267,26 @@ def build_transformer(
 
     # Features contextuales vía FiLM (opcional)
     feat_inp = None
+    feat_mod = None
     if feat_input_dim is not None and feat_input_dim > 0:
         feat_inp = layers.Input(shape=(feat_input_dim,), name="feat_input")
-        x = FiLM1D(channels=embed_dim, name="film0")(x, feat_inp)
+        feat_mod = _apply_feature_enricher(
+            feat_inp,
+            feature_enricher_units,
+            feature_enricher_activation,
+            feature_enricher_dropout,
+            "feat_enricher",
+        )
+        film_channels = int(x.shape[-1]) if x.shape[-1] is not None else int(input_shape[-1])
+        x = FiLM1D(channels=film_channels, name="film_in")(x, feat_mod)
+
+    feat_for_film = feat_mod if feat_mod is not None else feat_inp
 
     # Pila Transformer con RoPE (+FiLM opcional)
     for i in range(num_layers):
         x = transformer_block_rope(x, embed_dim, num_heads, mlp_dim, dropout_rate, name=f"encoder{i+1}")
-        if feat_inp is not None:
-            x = FiLM1D(embed_dim, name=f"film{i+1}")(x, feat_inp)
+        if feat_for_film is not None:
+            x = FiLM1D(embed_dim, name=f"film{i+1}")(x, feat_for_film)
         if use_se and i in (0, num_layers-1):
             x = se_block_1d(x, se_ratio=se_ratio, name=f"se_enc_{i+1}")
 

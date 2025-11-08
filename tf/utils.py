@@ -24,7 +24,7 @@ DEFAULT_WINDOW_SEC = 10.0
 DEFAULT_HOP_SEC = 5.0
 DEFAULT_EPS = 1e-8
 DEFAULT_TARGET_FS = float(PREPROCESS.get("resample", 256.0) or 256.0)
-DEFAULT_CONFIG_FILENAME = "nn_pipeline_config.json"
+DEFAULT_CONFIG_FILENAME = "cfg.json"
 
 DEFAULT_DATA_ROOTS = [
     Path("/home/sansan/projects/TFDev/DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3/edf/train"),
@@ -106,6 +106,15 @@ class PipelineConfig:
     transformer_koopman_loss_weight: float = 0.0
     transformer_bottleneck_dim: int | None = None
     transformer_expand_dim: int | None = None
+    use_input_se_block: bool = False
+    input_se_ratio: int = 8
+    use_input_conv_block: bool = False
+    input_conv_layers: int = 0
+    input_conv_filters: int = 32
+    input_conv_kernel_size: int = 5
+    feature_enricher_units: list[int] = field(default_factory=list)
+    feature_enricher_activation: str = "relu"
+    feature_enricher_dropout: float = 0.0
     learning_rate: float = 1e-3
     optimizer: str = "adam"
     optimizer_weight_decay: float = 0.0
@@ -228,14 +237,21 @@ def load_config(config_path: str | Path | None) -> PipelineConfig:
             "transformer_koopman_latent_dim",
             "transformer_bottleneck_dim",
             "transformer_expand_dim",
+            "input_se_ratio",
+            "input_conv_layers",
+            "input_conv_filters",
+            "input_conv_kernel_size",
         } and value is not None:
             value = int(value)
         elif fdef.name in {
             "transformer_dropout",
             "transformer_recon_weight",
             "transformer_koopman_loss_weight",
+            "feature_enricher_dropout",
         } and value is not None:
             value = float(value)
+        elif fdef.name == "feature_enricher_units" and value is not None:
+            value = [int(item) for item in value]
         elif fdef.name == "preprocess_n_harmonics" and value is not None:
             value = int(value)
         elif fdef.name == "selected_features" and value is not None:
@@ -357,6 +373,18 @@ def validate_config(config: PipelineConfig) -> PipelineConfig:
         raise ValueError("'epsilon' debe ser > 0.")
     if config.target_fs <= 0:
         raise ValueError("'target_fs' debe ser > 0.")
+    if config.input_se_ratio <= 0:
+        raise ValueError("'input_se_ratio' debe ser > 0.")
+    if config.input_conv_layers < 0:
+        raise ValueError("'input_conv_layers' debe ser >= 0.")
+    if config.input_conv_filters <= 0:
+        raise ValueError("'input_conv_filters' debe ser > 0.")
+    if config.input_conv_kernel_size <= 0:
+        raise ValueError("'input_conv_kernel_size' debe ser > 0.")
+    if config.feature_enricher_dropout < 0.0:
+        raise ValueError("'feature_enricher_dropout' debe ser >= 0.")
+    if any(unit <= 0 for unit in config.feature_enricher_units):
+        raise ValueError("'feature_enricher_units' debe contener valores > 0.")
     for attr_name in ("preprocess_bandpass", "preprocess_notch", "preprocess_normalize"):
         attr_value = getattr(config, attr_name)
         if attr_value is not None and not isinstance(attr_value, bool):
