@@ -136,8 +136,6 @@ La ventana principal mostrará la interfaz gráfica. A continuación se describe
 
 ![Captura de la GUI](assets/gui_screenshot.png)
 
-> Nota: coloca tu imagen en `assets/gui_screenshot.png` o edita la ruta en este README para que la vista previa muestre la interfaz aquí.
-
 ## Guía de la interfaz (panel lateral y área de gráficos)
 
 Controles principales en el panel izquierdo:
